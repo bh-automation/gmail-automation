@@ -1,4 +1,4 @@
-# Release-Gates 1.0.0rc1
+# Release-Gates 1.0.0rc2
 
 Stand: 2026-10-03 · alle Gates offline geprüft (kein Gmail-Konto, keine Secrets) · Python 3.12 und 3.13
 
@@ -12,7 +12,7 @@ Release-Regel: Alle Gates müssen PASS sein. Ein Critical- oder High-Finding aus
 | G2 Tests | komplette Suite, offline | `python -m pytest` – 356/356 (3.12 und 3.13) | PASS |
 | G3 Secret-Scan | Dateinamen, Inhalte, von Git verfolgte Dateien, Git-Historie | `tools/secret_scan.py`, `test_secret_scan_*`, `test_gitignore_covers_secrets_and_state` | PASS |
 | G4 OBSERVE kann nichts ändern | Policy (Profil), Adapter-Allow-List, Transport-Allow-List (OBSERVE erlaubt nur GET) | `test_observe_*`, `test_observe_client_cannot_mutate_and_never_reaches_fake`, `test_transport_allow_list` | PASS |
-| G5 Senden gesperrt | Policy-Invariante, Adapter-Guard, Transport-Guard, statischer Gate-Scan, Laufzeit-Selbsttest in jeder Zusammenfassung | `test_send_hard_block`, `test_monkeypatched_send_method_still_blocked`, `test_real_googleapiclient_service_cannot_send_even_without_the_adapter`, `test_draft_is_never_sent`, `SEND_BLOCK = PASS` | PASS |
+| G5 Senden gesperrt (in der Anwendung) | Policy-Invariante, Adapter-Guard, Transport-Guard, statischer Gate-Scan, Laufzeit-Selbsttest in jeder Zusammenfassung | `test_send_hard_block`, `test_monkeypatched_send_method_still_blocked`, `test_real_googleapiclient_service_cannot_send_even_without_the_adapter`, `test_draft_is_never_sent`, `SEND_BLOCK = PASS` | PASS |
 | G6 Endgültiges Löschen gesperrt | wie G5, zusätzlich trash/batchDelete und System-Labels im Request-Body | `test_delete_hard_block`, `test_system_and_foreign_labels_refused`, `test_C_M1_transport_refuses_system_labels_in_modify_body_and_method_override`, `DELETE_BLOCK = PASS` | PASS |
 | G7 DRY-RUN ohne Änderungen | Standardmodus, auch wenn Fähigkeiten eingeschaltet sind | `test_dry_run_has_zero_mutations_even_with_capabilities`, `test_run_without_apply_is_dry_run_even_with_env_and_config`, `test_dry_run_stays_mutation_free_with_all_new_checks` | PASS |
 | G8 Idempotenz | Idempotenz-Schlüssel, NOOP-Prüfung, Abgleich nach Absturz, Vorrang des Menschen | `test_reprocessing_unchanged_data_is_a_no_op`, `test_crash_*`, `test_manual_*`, `test_B_M1_*`, `test_C_L1_*` | PASS |
@@ -23,7 +23,7 @@ Release-Regel: Alle Gates müssen PASS sein. Ein Critical- oder High-Finding aus
 | G13 Grenze gegen Prompt-Injection | Mail-Inhalt ist nur Daten; versteckter Text steuert keine Regel; Geld-Guard sieht alle Teile; Header-Injection; Unicode | `test_prompt_injection_is_inert_data`, `test_injection_cannot_trigger_rules_via_quoted_text`, `test_hostile_mailbox_cannot_escalate`, `test_A_F1_*`, `test_A_F6_*`, `test_C_L7_*`, `test_C_L8_*` | PASS |
 | G14 OAuth-Scope-Prüfung | Scopes laut Googles Token-Antwort; Vollzugriff, send, insert und settings verboten; falscher Typ wird abgelehnt | `tests/test_auth.py`, `test_A_F3_scope_report_with_wrong_type_fails_closed` | PASS |
 | G15 CI ohne echtes Gmail | Workflow ohne Secrets; Fakes und Doubles | `.github/workflows/ci.yml`, `test_ci_workflow_covers_required_gates` | PASS |
-| G16 Saubere Git-Arbeitskopie | `git status --porcelain` leer beim Tag; keine Secret-Dateien verfolgt | geprüft vor `git tag v1.0.0-rc1` | PASS |
+| G16 Saubere Git-Arbeitskopie | `git status --porcelain` leer beim Tag; keine Secret-Dateien verfolgt | geprüft vor `git tag v1.0.0-rc2` | PASS |
 
 ## Red-Team-Ergebnis
 
@@ -48,7 +48,8 @@ Berichte mit Fix-Status: [A](RED_TEAM_A_REPORT.md) · [B](RED_TEAM_B_REPORT.md) 
 | R-7 | Der From-Header ist nicht authentifiziert (keine DMARC-Prüfung). | From-Regeln nur für risikoarme Zustände (Beispiel: REFERENCE); Entwürfe gehen nur an die From-Adresse |
 | R-8 | CI-Actions sind per Tag gepinnt, nicht per SHA; es gibt keine Hash-Locks (`--require-hashes`). | Vor einer Veröffentlichung die Actions auf Commit-SHAs pinnen und Dependabot aktivieren |
 | R-9 | Ein Entwurf, der genau im Absturzfenster bearbeitet oder verworfen wird, kann falsch zugeordnet oder einmal neu angelegt werden. | Selten; ein Entwurf wird nie gesendet |
-| R-10 | Das Verhalten gegen das echte Gmail ist nur mit Fakes und dem echten googleapiclient (ohne Netzwerk) getestet. | Erster Live-Lauf: `auth --profile observe` → `scan` → später `run --apply --max 5` |
+| R-10 | Das Verhalten gegen das echte Gmail ist nur mit Fakes und dem echten googleapiclient (ohne Netzwerk) getestet. | Gestufter Livetest vor `v1.0.0`: [LIVE_ROLLOUT.md](LIVE_ROLLOUT.md) |
 | R-11 | OAuth-Apps im Status *Testing*: Der Refresh-Token läuft laut Google nach 7 Tagen ab. | `auth` erneut ausführen; das Programm meldet `REFRESH_FAILED` sauber |
 | R-12 | Windows: ACLs des Token-Ordners werden nicht geprüft (nur POSIX-Rechte). | Der Datenordner liegt im Benutzerprofil (`%LOCALAPPDATA%`) |
 | R-13 | Eine Laufzeit-Deadline unterbricht keine hängende Berechnung (z. B. eine Regex). | Der ReDoS-Lint lehnt katastrophale Muster schon beim Laden der Konfiguration ab |
+| R-14 | Der APPLY-Token (`gmail.modify`) hat auf Google-Seite Lese-, Verfassen-, Sende- und Papierkorbrechte. Die Sperren gelten nur für diese Anwendung: Wer die Token-Datei erlangt, kann außerhalb der Anwendung senden. | Token nur außerhalb des Projekts (geprüft); APPLY-Token erst anlegen, wenn er gebraucht wird; für Scans OBSERVE nutzen; Zugriff im Google-Konto widerrufbar; der Vollzugriff-Scope bleibt verboten |

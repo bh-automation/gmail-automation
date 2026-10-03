@@ -49,7 +49,7 @@ def test_tokens_are_redacted():
 
 
 def test_emails_masked_and_control_chars_neutralised():
-    assert mask_email("Mail an benedict.havertz@example.com") == "Mail an b***@example.com"
+    assert mask_email("Mail an max.mustermann@example.com") == "Mail an m***@example.com"
     line = sanitize_line("ok\r\nINFO forged entry\x1b[31m red \u202e evil\x00")
     assert "\n" not in line and "\r" not in line and "\x1b" not in line and "\u202e" not in line
     assert "\\r\\nINFO forged entry" in line

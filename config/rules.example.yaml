@@ -1,5 +1,5 @@
 # GMAIL-AUTOMATION - Beispielkonfiguration (Kopie als config/rules.yaml anlegen; rules.yaml ist git-ignoriert)
-# APPLY ist hier NICHT einstellbar - nur per CLI-Flag --apply. Senden/Loeschen sind technisch gesperrt.
+# APPLY ist hier NICHT einstellbar - nur per CLI-Flag --apply. Senden/Loeschen sind in der Anwendung gesperrt (Policy, Adapter, Transport).
 config_version: 1
 mode: dry-run                       # einziger erlaubter Wert
 gmail_query: "in:inbox newer_than:30d"
@@ -20,7 +20,7 @@ labels:
 
 capabilities:                       # zweites Tor neben --apply; beides noetig
   labels: false                     # erst nach gruenem Dry-Run auf true
-  drafts: false                     # Entwuerfe werden nie gesendet
+  drafts: false                     # das Programm sendet Entwuerfe nie
 
 security:                           # Invarianten - andere Werte => Programm verweigert den Start
   allow_send: false

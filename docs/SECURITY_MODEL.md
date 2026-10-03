@@ -32,4 +32,4 @@ Vier unabhängige Barrieren zwischen Code und einer gefährlichen Gmail-Operatio
 3. **Transport-Allow-List** (`GuardedHttp`): Methode, Host, Pfad und Body jedes ausgehenden HTTP-Requests. Erlaubt sind nur `Label_<n>`-IDs in modify-Bodies und threadgebundene Entwürfe. Kein Redirect, kein Method-Override. Der Refresh-Transport erreicht nur den OAuth-Token-Endpunkt.
 4. **Statischer Gate-Scan** (`tools/forbidden_scan.py`, CI und `verify.ps1`): verbietet verbotene Methodennamen, Reflection, Transport- und Credential-Importe außerhalb von Adapter und Auth sowie Re-Importe und Aliasing.
 
-Vertrauensannahme: Das sind Kontrollen im selben Prozess. Bösartiger Code im selben Interpreter ist ein dokumentiertes Restrisiko (R-1 in `RELEASE_GATES.md`).
+Vertrauensannahme: Das sind Kontrollen im selben Prozess. Bösartiger Code im selben Interpreter ist ein dokumentiertes Restrisiko (R-1 in `RELEASE_GATES.md`). Der APPLY-Token (`gmail.modify`) hätte auf Google-Seite Senderechte; die Sperren gelten für diese Anwendung, nicht für den Token (R-14).

@@ -1,4 +1,5 @@
-"""Draft creation only. Sending is impossible in V1 (policy + adapter + transport hard block).
+"""Draft creation only. Sending is blocked in V1 by policy, adapter and transport allow-listing
+(the gmail.modify token itself would permit sending at Google's side - see docs/RELEASE_GATES.md R-14).
 
 Drafts use static operator templates. No message content is copied into a draft body,
 and header values from untrusted mail are validated against header injection.

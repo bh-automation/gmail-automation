@@ -76,7 +76,7 @@ def test_injection_cannot_trigger_rules_via_quoted_text():
 
 
 def test_own_last_message_is_waiting():
-    c = cls(labels=("SENT",), from_="Benedict <me@example.com>", plain="Ich warte auf Ihre Bestaetigung")
+    c = cls(labels=("SENT",), from_="Max <me@example.com>", plain="Ich warte auf Ihre Bestaetigung")
     assert (c.state, c.band) == (State.WAITING, Band.AUTO)
 
 

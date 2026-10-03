@@ -4,7 +4,7 @@ Lokale, abgesicherte Gmail-Automatisierung für Windows: **lesen → klassifizie
 
 Standard ist immer **DRY-RUN**: Das Programm zeigt nur an, was es tun würde. Änderungen am Postfach brauchen drei Dinge gleichzeitig: das CLI-Flag `--apply`, das OAuth-Profil **APPLY** und eine eingeschaltete Fähigkeit in `config/rules.yaml`.
 
-## Sicherheitszusagen (V1, technisch erzwungen)
+## Sicherheitszusagen (V1, in der Anwendung erzwungen)
 
 | Zusage | Wie sie erzwungen wird |
 |---|---|
@@ -17,6 +17,8 @@ Standard ist immer **DRY-RUN**: Das Programm zeigt nur an, was es tun würde. Ä
 | Unsicher → REVIEW | Konfidenz unter 0,85 führt nie zu einer riskanten Aktion; unter 0,60 gibt es gar keine Änderung |
 | Fehler → Stopp | globale Fehler beenden den Lauf („fail closed“); nur eine einzelne abgelehnte Nachricht wird übersprungen und nach 3 Fehlern in Quarantäne gestellt |
 | Der Mensch hat das letzte Wort | ändert jemand die App-Labels von Hand, fasst das Programm diese Nachricht nicht mehr an |
+
+**Wichtig zur OAuth-Berechtigung:** Für Labels und Entwürfe verlangt Google den Scope `gmail.modify`. Dieser Scope würde auf Google-Seite auch Lesen, Verfassen und **Senden** erlauben; nur das sofortige endgültige Löschen erlaubt er nicht. Die Zusagen oben sind deshalb Sperren **der Anwendung**: GMAIL-AUTOMATION v1 bietet keinen Weg zum Senden oder Löschen und lässt keinen solchen HTTP-Endpunkt durch (Policy, Adapter, Transport-Allow-List). Der APPLY-Token selbst ist ein schützenswertes Geheimnis: Er liegt nur in `%LOCALAPPDATA%\GmailAutomation\` und lässt sich im Google-Konto jederzeit widerrufen (Sicherheit → *Drittanbieter-Apps mit Kontozugriff*). Für reine Scans reicht das Profil OBSERVE.
 
 ## Schnellstart (Windows)
 
@@ -46,7 +48,7 @@ Erst wenn der Scan so aussieht, wie Sie es wollen:
 .venv\Scripts\python.exe -m src.cli undo --last-run --apply      # zurücksetzen
 ```
 
-Entwürfe werden **nie** gesendet und nie automatisch gelöscht. Undo listet sie nur zum manuellen Prüfen auf.
+Das Programm sendet Entwürfe nie und löscht sie nie automatisch; Undo listet sie nur zum manuellen Prüfen auf. Vor dem ersten APPLY auf das ganze Postfach den [gestuften Livetest](docs/LIVE_ROLLOUT.md) durchlaufen.
 
 **Hinweis zum Testing-Modus:** Laut Google-Dokumentation laufen Refresh-Tokens von OAuth-Apps im Status *Testing* (Nutzertyp *Extern*) nach **7 Tagen** ab. Danach meldet das Programm `REFRESH_FAILED`. Dann einfach `auth --profile observe` bzw. `auth --profile apply` erneut ausführen.
 
@@ -117,6 +119,7 @@ Die Tests brauchen kein Gmail-Konto und keine Secrets. CI läuft auf Ubuntu und 
 
 ## Dokumentation
 
+- [Gestufter Livetest mit dem echten Gmail-Konto](docs/LIVE_ROLLOUT.md)
 - [Release-Gates G1–G16 und Restrisiken](docs/RELEASE_GATES.md)
 - [Bedrohungsmodell](docs/THREAT_MODEL.md) · [Sicherheitsmodell](docs/SECURITY_MODEL.md) · [Architektur](docs/ARCHITECTURE.md) · [OAuth-Scope-Matrix](docs/OAUTH_SCOPE_MATRIX.md)
 - Red-Team-Berichte: [A – Angriffe auf das Produkt](docs/RED_TEAM_A_REPORT.md) · [B – Betrieb und Zuverlässigkeit](docs/RED_TEAM_B_REPORT.md) · [C – Prüfung der Fixes](docs/RED_TEAM_C_FIX_VERIFICATION.md)
