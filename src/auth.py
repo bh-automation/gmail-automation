@@ -134,9 +134,22 @@ def _default_refresh_grant() -> Callable[..., Any]:
 
 
 def _default_request() -> Any:
+    """Token-refresh transport that can reach ONLY the OAuth token endpoint (POST, no redirects)."""
+    import requests
     from google.auth.transport.requests import Request
 
-    return Request()
+    from .errors import PolicyViolation
+
+    class _TokenOnlySession(requests.Session):
+        def request(self, method: str | bytes, url: str | bytes, *args: Any, **kwargs: Any) -> Any:
+            m = method.decode() if isinstance(method, bytes) else method
+            u = url.decode() if isinstance(url, bytes) else url
+            if m.upper() != "POST" or u != TOKEN_URI:
+                raise PolicyViolation("Refresh transport: token endpoint only", code="TRANSPORT_TOKEN")
+            kwargs["allow_redirects"] = False
+            return super().request(m, u, *args, **kwargs)
+
+    return Request(session=_TokenOnlySession())
 
 
 TOKEN_URI = "https://oauth2.googleapis.com/token"  # noqa: S105 - endpoint URL, not a secret

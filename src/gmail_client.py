@@ -19,6 +19,7 @@ or reflection paths out of the code base.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -33,6 +34,7 @@ from .errors import (
     AmbiguousWriteError,
     AuthError,
     GmailApiError,
+    GmailAutomationError,
     PolicyViolation,
     RunBudgetExceeded,
     ScopeError,
@@ -123,6 +125,41 @@ TRANSPORT_RULES: Final[tuple[tuple[str, str, re.Pattern[str]], ...]] = (
 )
 
 
+def _json_body(body: Any) -> Any:
+    try:
+        text = body.decode("utf-8") if isinstance(body, bytes | bytearray) else body
+        return json.loads(text) if isinstance(text, str) else None
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
+def check_transport_body(endpoint: str, body: Any) -> None:
+    """Body-level second barrier: modify may only touch user label ids, drafts must be thread-linked."""
+    if endpoint == "users.messages.modify":
+        data = _json_body(body)
+        if not isinstance(data, dict) or set(data) - {"addLabelIds", "removeLabelIds"}:
+            raise PolicyViolation("Transport: unexpected modify body", code="TRANSPORT_BODY")
+        for key in ("addLabelIds", "removeLabelIds"):
+            ids = data.get(key, [])
+            if not isinstance(ids, list) or not all(isinstance(i, str) and is_user_label_id(i) for i in ids):
+                raise PolicyViolation("Transport: system or unknown label id in modify", code="TRANSPORT_BODY")
+    elif endpoint == "users.drafts.create":
+        data = _json_body(body)
+        msg = data.get("message") if isinstance(data, dict) else None
+        if (
+            not isinstance(msg, dict)
+            or set(data) != {"message"}
+            or not isinstance(msg.get("threadId"), str)
+            or not msg.get("threadId")
+            or not isinstance(msg.get("raw"), str)
+        ):
+            raise PolicyViolation("Transport: draft must be a raw message linked to a thread", code="TRANSPORT_BODY")
+    elif endpoint == "users.labels.create":
+        data = _json_body(body)
+        if not isinstance(data, dict) or not isinstance(data.get("name"), str):
+            raise PolicyViolation("Transport: unexpected label body", code="TRANSPORT_BODY")
+
+
 def check_transport(method: str, uri: str, allowed: frozenset[str]) -> str:
     """Raise PolicyViolation unless an outgoing HTTP request maps to an allow-listed endpoint."""
     parts = urlsplit(str(uri))
@@ -160,7 +197,10 @@ class GuardedHttp(httplib2.Http):
         redirections: int = httplib2.DEFAULT_MAX_REDIRECTS,
         connection_type: Any = None,
     ) -> Any:
-        check_transport(method, uri, self.transport_allowed)
+        endpoint = check_transport(method, uri, self.transport_allowed)
+        if any(str(k).lower() == "x-http-method-override" for k in (headers or {})):
+            raise PolicyViolation("Transport: HTTP method override refused", code="TRANSPORT_METHOD_OVERRIDE")
+        check_transport_body(endpoint, body)
         return super().request(
             uri, method, body=body, headers=headers, redirections=redirections, connection_type=connection_type
         )
@@ -307,7 +347,27 @@ class GmailClient:
         return self._root.users()
 
     def _execute(self, endpoint: str, factory: Callable[[], Any], *, mutating: bool = False) -> Any:
-        """Run one API request with the bounded retry policy. Never retries ambiguous writes."""
+        """Run one API request with the bounded retry policy. Never retries ambiguous writes.
+
+        Once an attempt of a mutating call failed with 5xx/network, the write may already be
+        in Gmail: any later failure of that call is reported as AmbiguousWriteError, so the
+        caller re-reads and settles instead of recording a terminal FAILED.
+        """
+        maybe_applied = [False]
+        try:
+            return self._execute_with_retry(endpoint, factory, mutating, maybe_applied)
+        except GmailAutomationError as err:
+            if mutating and maybe_applied[0] and not isinstance(err, AmbiguousWriteError | PolicyViolation):
+                raise AmbiguousWriteError(
+                    f"{endpoint}: outcome unknown after a transient failure ({err.code})",
+                    code=f"AMBIGUOUS_{err.code}",
+                    status=getattr(err, "status", None),
+                ) from None
+            raise
+
+    def _execute_with_retry(
+        self, endpoint: str, factory: Callable[[], Any], mutating: bool, maybe_applied: list[bool]
+    ) -> Any:
         refreshed = False
         attempt = 0
         while True:
@@ -325,6 +385,8 @@ class GmailClient:
                 raise
             except Exception as exc:  # noqa: BLE001 - classified below, nothing is swallowed
                 info = classify(exc)
+                if mutating and info.kind in (ErrorKind.SERVER, ErrorKind.NETWORK):
+                    maybe_applied[0] = True
                 if info.kind is ErrorKind.AUTH:
                     if refreshed or self._refresh is None:
                         raise AuthError("Gmail rejected credentials (401) after refresh", code="AUTH_401") from None
