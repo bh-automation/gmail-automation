@@ -49,5 +49,9 @@ warn_redundant_casts = true
 no_implicit_optional = true
 
 [[tool.mypy.overrides]]
-module = ["googleapiclient.*", "google_auth_oauthlib.*", "google.*", "httplib2.*"]
+module = ["googleapiclient.*", "google_auth_oauthlib.*", "google_auth_httplib2.*", "google.*", "httplib2.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["re._parser", "re._constants"]  # stdlib regex parser (used by the ReDoS lint), no stubs
 ignore_missing_imports = true

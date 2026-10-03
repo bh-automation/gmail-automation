@@ -7,15 +7,29 @@ nothing in a message can add rules, change thresholds or request an action.
 
 from __future__ import annotations
 
+import re
+
 from .config import Config, Rule
 from .models import Band, Classification, NormalizedMessage, State, ThreadSnapshot
 
 PARSE_ERROR_CONFIDENCE = 0.65
 CONFLICT_CONFIDENCE = 0.70
+MONEY_GUARD_CONFIDENCE = 0.75
+MAX_MATCH_CHARS = 20_000  # regexes only ever see a bounded slice of untrusted text
+
+# Built-in, non-configurable guard: money / payment / credential wording never leads to an
+# automatic ACTION (and therefore never to an auto-draft). It routes to REVIEW instead.
+_MONEY_GUARD = re.compile(
+    r"(?i)(bezahl|zahlung|zahle|überweis|ueberweis|rechnung|mahnung|inkasso|\biban\b|\bbic\b|\bswift\b|"
+    r"bankverbindung|kontodaten|kontonummer|gutschein|geschenkkarte|gift ?cards?|wire transfer|bank transfer|"
+    r"\bpayment|\bpay\b|\binvoice|\bremit|bitcoin|\bbtc\b|crypto|krypto|wallet|paypal|western union|moneygram|"
+    r"passwort|password|\btan\b|\bpin\b)"
+)
 
 
 def _rule_matches(rule: Rule, msg: NormalizedMessage) -> bool:
     w = rule.when
+    newest = msg.newest_text[:MAX_MATCH_CHARS]
     if w.newest_is_sent is not None and msg.is_sent != w.newest_is_sent:
         return False
     if w.from_domains and not any(msg.from_domain == d or msg.from_domain.endswith("." + d) for d in w.from_domains):
@@ -26,10 +40,10 @@ def _rule_matches(rule: Rule, msg: NormalizedMessage) -> bool:
         return False
     if w.subject_regex is not None and not w.subject_regex.search(msg.subject):
         return False
-    if w.body_regex is not None and not w.body_regex.search(msg.newest_text):
+    if w.body_regex is not None and not w.body_regex.search(newest):
         return False
     if w.any_regex:
-        haystacks = [msg.subject if f == "subject" else msg.newest_text for f in w.any_fields]
+        haystacks = [msg.subject if f == "subject" else newest for f in w.any_fields]
         if not any(p.search(h) for p in w.any_regex for h in haystacks):
             return False
     return True
@@ -78,5 +92,13 @@ def classify(msg: NormalizedMessage, thread: ThreadSnapshot | None, cfg: Config)
             state, min(best.confidence, CONFLICT_CONFIDENCE), band, "builtin:tie", ("equal-confidence rules disagree",)
         )
     state, band = _band(best.state, best.confidence, cfg)
+    if (
+        state is State.ACTION
+        and band is Band.AUTO
+        and _MONEY_GUARD.search(msg.subject + "\n" + msg.newest_text[:MAX_MATCH_CHARS])
+    ):
+        conf = min(best.confidence, MONEY_GUARD_CONFIDENCE)
+        state, band = _band(State.REVIEW, conf, cfg)
+        return Classification(state, conf, band, "builtin:money-guard", (f"rule {best.id} + money/credential wording",))
     draft = best.draft_template if (band is Band.AUTO and state is State.ACTION) else None
     return Classification(state, best.confidence, band, best.id, (f"rule {best.id}",), draft_template=draft)

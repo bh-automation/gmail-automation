@@ -7,6 +7,8 @@ APPLY is reachable only through the explicit CLI flag `--apply`.
 from __future__ import annotations
 
 import re
+import re._constants as sre_c
+import re._parser as sre_p
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -125,12 +127,56 @@ def _int(v: Any, name: str, lo: int, hi: int) -> int:
     return int(v)
 
 
+_REPEATS = (sre_c.MAX_REPEAT, sre_c.MIN_REPEAT)
+
+
+def _subpatterns(op: Any, av: Any) -> list[Any]:
+    """Child sub-patterns of one parsed regex node (atomic groups / possessive repeats never backtrack)."""
+    if op in _REPEATS:
+        return [av[2]]
+    if op == sre_c.SUBPATTERN:
+        return [av[3]]
+    if op == sre_c.BRANCH:
+        return list(av[1])
+    if op in (sre_c.ASSERT, sre_c.ASSERT_NOT):
+        return [av[1]]
+    if op == sre_c.GROUPREF_EXISTS:
+        return [x for x in av[1:] if x is not None]
+    return []
+
+
+def _has_unbounded_repeat(items: Any) -> bool:
+    for op, av in items:
+        if op in _REPEATS and av[1] == sre_c.MAXREPEAT:
+            return True
+        if any(_has_unbounded_repeat(sub) for sub in _subpatterns(op, av)):
+            return True
+    return False
+
+
+def _nested_unbounded(items: Any) -> bool:
+    """True for catastrophic-backtracking shapes such as (a+)+, (a*)*, (\\w+\\s*)*."""
+    for op, av in items:
+        if op in _REPEATS and av[1] == sre_c.MAXREPEAT and _has_unbounded_repeat(av[2]):
+            return True
+        if any(_nested_unbounded(sub) for sub in _subpatterns(op, av)):
+            return True
+    return False
+
+
 def _regex(v: Any, name: str) -> re.Pattern[str]:
     _require(isinstance(v, str) and 0 < len(v) <= MAX_REGEX_LEN, f"{name} must be a regex string")
     try:
-        return re.compile(v)
-    except re.error as exc:
+        compiled = re.compile(v)
+        parsed = sre_p.parse(v)
+    except (re.error, RecursionError, OverflowError) as exc:
         raise _err(f"{name} is not a valid regex: {exc}") from None
+    if _nested_unbounded(parsed):
+        raise _err(
+            f"{name} nests unbounded quantifiers (e.g. (a+)+) - catastrophic backtracking on hostile mail; "
+            "rewrite it, or make the inner quantifier possessive (a++) / atomic (?>...)"
+        )
+    return compiled
 
 
 def _str_list(v: Any, name: str) -> list[str]:
@@ -324,6 +370,28 @@ def parse_config(data: Any, source: str = "<memory>") -> Config:
     )
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """SafeLoader that rejects duplicate mapping keys (a later key must not silently win)."""
+
+
+def _construct_unique_mapping(loader: yaml.SafeLoader, node: yaml.MappingNode, deep: bool = False) -> dict[Any, Any]:
+    loader.flatten_mapping(node)
+    seen: set[Any] = set()
+    for key_node, _ in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in seen
+            seen.add(key)
+        except TypeError:
+            raise yaml.constructor.ConstructorError(None, None, "unhashable mapping key", key_node.start_mark) from None
+        if duplicate:
+            raise yaml.constructor.ConstructorError(None, None, f"duplicate key {key!r}", key_node.start_mark)
+    return loader.construct_mapping(node, deep=deep)
+
+
+_UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping)
+
+
 def load_config(path: Path) -> Config:
     try:
         p = Path(path)
@@ -335,9 +403,8 @@ def load_config(path: Path) -> Config:
     if len(raw) > MAX_CONFIG_BYTES:
         raise ConfigError("Config file too large", code="CONFIG_TOO_LARGE")
     try:
-        data = yaml.safe_load(raw.decode("utf-8"))
+        data = yaml.load(raw.decode("utf-8"), Loader=_UniqueKeyLoader)  # noqa: S506 - SafeLoader subclass
     except (UnicodeDecodeError, yaml.YAMLError) as exc:
-        raise ConfigError(
-            f"Config is not valid UTF-8 YAML: {exc.__class__.__name__}", code="CONFIG_MALFORMED"
-        ) from None
+        detail = "duplicate key" if "duplicate key" in str(exc) else exc.__class__.__name__
+        raise ConfigError(f"Config is not valid UTF-8 YAML: {detail}", code="CONFIG_MALFORMED") from None
     return parse_config(data, source=str(p))

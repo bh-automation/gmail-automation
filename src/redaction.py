@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import unicodedata
 
 _EMAIL_RE = re.compile(r"([A-Za-z0-9._%+\-])[A-Za-z0-9._%+\-]*@([A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+)")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
@@ -44,11 +45,19 @@ def mask_email(text: str) -> str:
     return _EMAIL_RE.sub(lambda m: f"{m.group(1)}***@{m.group(2)}", text)
 
 
+def _strip_format_chars(text: str) -> str:
+    """Remove every Unicode format character (category Cf): bidi marks, zero-width chars, ALM, ..."""
+    if text.isascii():
+        return text
+    return "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+
+
 def sanitize_line(text: str, max_len: int = 400) -> str:
     """Single-line, control-free, length-bounded text (prevents log/terminal injection)."""
     text = _ANSI_RE.sub("", text)
     text = text.replace("\r", "\\r").replace("\n", "\\n")
     text = _CONTROL_RE.sub("?", text)
+    text = _strip_format_chars(text)
     if len(text) > max_len:
         text = text[: max_len - 3] + "..."
     return text

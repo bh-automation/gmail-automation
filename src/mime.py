@@ -36,16 +36,31 @@ _KEEP_HEADERS = {
     "precedence",
 }
 _REPLY_MARKERS = (
-    re.compile(r"^\s*On .{1,200} wrote:\s*$", re.I),
-    re.compile(r"^\s*Am .{1,200} schrieb .{0,200}:\s*$", re.I),
+    re.compile(r"^\s*On .{1,200} wrote:\s*$", re.I),  # EN
+    re.compile(r"^\s*Am .{1,200} schrieb .{0,200}:\s*$", re.I),  # DE
+    re.compile(r"^\s*Le .{1,200} a (é|e)crit\s*:\s*$", re.I),  # FR
+    re.compile(r"^\s*El .{1,200} escribi(ó|o)\s*:\s*$", re.I),  # ES
+    re.compile(r"^\s*Il .{1,200} ha scritto\s*:\s*$", re.I),  # IT
+    re.compile(r"^\s*Op .{1,200} schreef .{0,200}:\s*$", re.I),  # NL
+    re.compile(r"^\s*Em .{1,200} escreveu\s*:\s*$", re.I),  # PT
     re.compile(
-        r"^\s*-{2,}\s*(Original Message|Urspr(ü|ue)ngliche Nachricht|Forwarded message|"
-        r"Weitergeleitete Nachricht)\s*-{2,}\s*$",
+        r"^\s*-{2,}\s*(Original Message|Urspr(ü|ue)ngliche Nachricht|Forwarded message|Weitergeleitete Nachricht|"
+        r"Message d.origine|Message transf(é|e)r(é|e)|Mensaje original|Mensaje reenviado|Messaggio originale|"
+        r"Messaggio inoltrato|Oorspronkelijk bericht|Doorgestuurd bericht|Mensagem original|Mensagem encaminhada)"
+        r"\s*-{2,}\s*$",
         re.I,
     ),
 )
-_OUTLOOK_HEADER = re.compile(r"^\s*(From|Von):\s.+$", re.I)
-_OUTLOOK_FOLLOW = re.compile(r"^\s*(Sent|Gesendet|Date|Datum):\s.+$", re.I)
+_OUTLOOK_HEADER = re.compile(r"^\s*\*?(From|Von|De|Da|Van)\s?:\*?\s.+$", re.I)
+_OUTLOOK_FOLLOW = re.compile(
+    r"^\s*\*?(Sent|Gesendet|Date|Datum|Envoy(é|e)|Enviado|Inviato|Verzonden|Fecha|Data)\s?:\*?\s.+$", re.I
+)
+# Inline styles that hide text from the human reader; hidden text never counts as content.
+_HIDDEN_STYLE = re.compile(
+    r"display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0(?![.\d]*[1-9])|opacity\s*:\s*0(?![.\d]*[1-9])",
+    re.I,
+)
+_VOID_TAGS = frozenset({"br", "hr", "img", "meta", "link", "input", "area", "base", "col", "embed", "source", "wbr"})
 
 
 class _MimeParseError(Exception):
@@ -71,7 +86,9 @@ def decode_header_value(value: Any, max_len: int = 998) -> str:
         text = str(make_header(decode_header(value)))
     except Exception:  # noqa: BLE001 - RFC 2047 garbage must not crash the scan
         text = value
-    text = _CTRL_RE.sub(" ", text).replace("\r", " ").replace("\n", " ")
+    # Every str.splitlines() boundary (CR, LF, VT, FF, FS/GS/RS, NEL, U+2028, U+2029) becomes a
+    # space: the email package rejects any header value that splits into more than one line.
+    text = " ".join(_CTRL_RE.sub(" ", text).splitlines())
     return text[:max_len].strip()
 
 
@@ -100,8 +117,9 @@ class _HtmlText(HTMLParser):
         self.parts: list[str] = []
         self.skip_depth = 0
         self.quote_depth = 0
+        self.hidden_depth = 0
         self.drop_quotes = drop_quotes
-        self.stack: list[tuple[str, bool]] = []
+        self.stack: list[tuple[str, bool, bool]] = []
 
     def _is_quote(self, tag: str, attrs: list[tuple[str, str | None]]) -> bool:
         if not self.drop_quotes:
@@ -113,31 +131,42 @@ class _HtmlText(HTMLParser):
         ident = a.get("id", "").lower()
         return "gmail_quote" in cls or ident in {"divrplyfwdmsg", "appendonsend"} or "moz-cite-prefix" in cls
 
+    @staticmethod
+    def _is_hidden(attrs: list[tuple[str, str | None]]) -> bool:
+        a = {k.lower(): (v or "") for k, v in attrs}
+        return "hidden" in a or bool(_HIDDEN_STYLE.search(a.get("style", "")))
+
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag in self._SKIP:
             self.skip_depth += 1
-        quote = self._is_quote(tag, attrs)
-        if quote:
-            self.quote_depth += 1
-        if tag not in {"br", "hr", "img", "meta", "link", "input"}:
-            self.stack.append((tag, quote))
+        if tag not in _VOID_TAGS:
+            quote = self._is_quote(tag, attrs)
+            hidden = self._is_hidden(attrs)
+            if quote:
+                self.quote_depth += 1
+            if hidden:
+                self.hidden_depth += 1
+            self.stack.append((tag, quote, hidden))
         if tag in self._BLOCK:
             self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
         if tag in self._SKIP and self.skip_depth:
             self.skip_depth -= 1
-        while self.stack:
-            t, quote = self.stack.pop()
-            if quote and self.quote_depth:
-                self.quote_depth -= 1
-            if t == tag:
-                break
+        if any(t == tag for t, _, _ in self.stack):
+            while self.stack:
+                t, quote, hidden = self.stack.pop()
+                if quote and self.quote_depth:
+                    self.quote_depth -= 1
+                if hidden and self.hidden_depth:
+                    self.hidden_depth -= 1
+                if t == tag:
+                    break
         if tag in self._BLOCK:
             self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:
-        if not self.skip_depth and not self.quote_depth:
+        if not self.skip_depth and not self.quote_depth and not self.hidden_depth:
             self.parts.append(data)
 
 
