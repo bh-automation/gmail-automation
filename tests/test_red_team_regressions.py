@@ -963,3 +963,47 @@ def test_C_I1_unreadable_anchor_location_is_not_called_corrupt(data_dir, tmp_pat
     with pytest.raises(AuditUnavailableError) as e2:
         AuditLedger(db, head_path=blocker / "x.head.json")
     assert e2.value.code == "AUDIT_ANCHOR_UNREADABLE"
+
+
+def test_B_M3_concurrent_reader_never_raises_a_false_anchor_alarm(tmp_path):
+    """status/doctor take no lock: opening the ledger while a run writes must never report tampering
+    (the anchor is written after COMMIT - the very first rows of a fresh ledger are the critical window)."""
+    import subprocess
+    import sys
+    import textwrap
+
+    root = Path(__file__).resolve().parents[1]
+    db = tmp_path / "audit.sqlite3"
+    env = {**os.environ, "GMAIL_AUTOMATION_ANCHOR_DIR": str(tmp_path / "anchors"), "PYTHONPATH": str(root)}
+    writer = textwrap.dedent(f"""
+        from pathlib import Path
+        from src.audit import AuditLedger
+        led = AuditLedger(Path({str(db)!r}))
+        for i in range(400):
+            led.append(run_id="w", profile="apply", mode="APPLY", event="PLAN", message_id=f"m{{i}}")
+        led.close()
+    """)
+    reader = textwrap.dedent(f"""
+        import json, time
+        from pathlib import Path
+        from src.audit import AuditLedger
+        from src.errors import GmailAutomationError
+        alarms, opens, t_end = [], 0, time.time() + 3
+        while time.time() < t_end:
+            try:
+                led = AuditLedger(Path({str(db)!r}))
+                ok, msg = led.verify()
+                if not ok:
+                    alarms.append(msg)
+                led.close()
+                opens += 1
+            except GmailAutomationError as exc:
+                if exc.code != "AUDIT_LOCKED":
+                    alarms.append(exc.code)
+        print(json.dumps({{"opens": opens, "alarms": alarms}}))
+    """)
+    w = subprocess.Popen([sys.executable, "-c", writer], env=env)
+    r = subprocess.run([sys.executable, "-c", reader], env=env, capture_output=True, text=True, timeout=120)
+    assert w.wait(timeout=120) == 0
+    stats = json.loads(r.stdout.strip().splitlines()[-1])
+    assert stats["opens"] > 5 and stats["alarms"] == [], stats

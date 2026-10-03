@@ -244,6 +244,8 @@ class AuditLedger:
             )
         for version in range(current + 1, SCHEMA_VERSION + 1):
             with self._tx() as db:
+                if self._version() >= version:
+                    continue  # another process applied this migration while we waited for the lock
                 if version == 1:
                     db.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
                 for i, stmt in enumerate(MIGRATIONS[version]):
