@@ -1,4 +1,4 @@
-# Release-Gates 1.0.0rc3
+# Release-Gates 1.0.0
 
 Stand: 2026-10-03 · alle Gates offline geprüft (kein Gmail-Konto, keine Secrets) · Python 3.12 und 3.13
 
@@ -23,7 +23,7 @@ Release-Regel: Alle Gates müssen PASS sein. Ein Critical- oder High-Finding aus
 | G13 Grenze gegen Prompt-Injection | Mail-Inhalt ist nur Daten; versteckter Text steuert keine Regel; Geld-Guard sieht alle Teile; Header-Injection; Unicode | `test_prompt_injection_is_inert_data`, `test_injection_cannot_trigger_rules_via_quoted_text`, `test_hostile_mailbox_cannot_escalate`, `test_A_F1_*`, `test_A_F6_*`, `test_C_L7_*`, `test_C_L8_*` | PASS |
 | G14 OAuth-Scope-Prüfung | Scopes laut Googles Token-Antwort; Vollzugriff, send, insert und settings verboten; falscher Typ wird abgelehnt | `tests/test_auth.py`, `test_A_F3_scope_report_with_wrong_type_fails_closed` | PASS |
 | G15 CI ohne echtes Gmail | Workflow ohne Secrets; Fakes und Doubles | `.github/workflows/ci.yml`, `test_ci_workflow_covers_required_gates` | PASS |
-| G16 Saubere Git-Arbeitskopie | `git status --porcelain` leer beim Tag; keine Secret-Dateien verfolgt | geprüft vor `git tag v1.0.0-rc3` | PASS |
+| G16 Saubere Git-Arbeitskopie | `git status --porcelain` leer beim Tag; keine Secret-Dateien verfolgt | geprüft vor `git tag v1.0.0` | PASS |
 
 ## Red-Team-Ergebnis
 

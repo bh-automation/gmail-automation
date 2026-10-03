@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.0 – 2026-10-03
+
+Erstes stabiles Release. Gegenüber 1.0.0rc3 nur eine Inhaltsänderung, keine neuen Funktionen.
+
+- Vorlage `ack_received` neutralisiert: „Vielen Dank, ich habe Ihre Nachricht erhalten.“ Die Zusage „melde mich zeitnah“ ist entfernt; ein Entwurf verspricht nichts mehr.
+- Live-Freigabe auf echtem Gmail-Konto (Windows 11): OBSERVE-Livetest, Interaktions-Red-Team (Prompt Injection, HTML/XSS, gefälschter Modus/Confidence/Capability, Host/Origin/Cross-Site), APPLY-Label-Canary mit Idempotenz und Undo, Entwurf-Canary mit Duplikatschutz. Nachweise in `docs/RELEASE_EVIDENCE_1.0.0.md`.
+- Sichere Voreinstellung bleibt: `labels: false`, `drafts: false`, DRY-RUN. Eine allgemeine Inbox-Automatisierung ist nicht aktiviert.
+- Bekannt, bewusst offen (nach 1.0.0): Feinabstimmung der Geld-Regel und der Fälle ohne Regeltreffer; unter Windows-Anwendungssteuerung kann `ruff.exe` blockiert sein (BLOCKED_ENVIRONMENT, Lint läuft in der Linux-CI).
+
 ## 1.0.0rc3 – 2026-10-03
 
 Windows-Kompatibilität. Keine Verhaltensänderung an Policy-Kernel, Send-/Delete-Sperre, Gmail-Mutationspfad, OAuth-Modell oder Mission Control.
