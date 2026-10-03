@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 from pathlib import Path
@@ -16,8 +17,14 @@ class SingleInstanceLock:
         self._fh: IO[str] | None = None
 
     def acquire(self) -> SingleInstanceLock:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fh = open(self.path, "a+", encoding="ascii")  # noqa: SIM115 - held for the process lifetime
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fh = open(self.path, "a+", encoding="ascii")  # noqa: SIM115 - held for the process lifetime
+        except OSError as exc:
+            raise LockError(
+                f"Lock file not writable ({exc.__class__.__name__}) - check permissions of the data folder",
+                code="LOCK_UNAVAILABLE",
+            ) from None
         try:
             if sys.platform == "win32":
                 import msvcrt
@@ -31,10 +38,11 @@ class SingleInstanceLock:
         except OSError:
             fh.close()
             raise LockError("Another GMAIL-AUTOMATION instance is running (lock held)", code="LOCKED") from None
-        fh.seek(0)
-        fh.truncate()
-        fh.write(str(os.getpid()))
-        fh.flush()
+        with contextlib.suppress(OSError):  # the OS lock is held; the PID note is informational only
+            fh.seek(0)
+            fh.truncate()
+            fh.write(str(os.getpid()))
+            fh.flush()
         self._fh = fh
         return self
 
