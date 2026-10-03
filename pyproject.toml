@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gmail-automation"
+version = "1.0.0rc1"
+description = "Secure-by-default local Gmail automation: observe, classify, label, draft - audited and undoable."
+requires-python = ">=3.12"
+dependencies = [
+  "google-api-python-client>=2.100,<3",
+  "google-auth>=2.30,<3",
+  "google-auth-oauthlib>=1.2,<2",
+  "google-auth-httplib2>=0.2,<1",
+  "PyYAML>=6,<7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.10", "types-PyYAML"]
+
+[tool.setuptools]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q -p no:cacheprovider"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = ["prototype-react", "visuals"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "BLE", "N", "SIM"]
+ignore = ["SIM105", "N818"]  # PolicyViolation/FailClosed names are part of the spec
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S108", "S603", "S607", "N802", "N803", "B011", "B018", "BLE001", "SIM115"]
+"tools/**" = ["S603", "S607"]
+
+[tool.mypy]
+python_version = "3.12"
+packages = ["src"]
+check_untyped_defs = true
+disallow_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+
+[[tool.mypy.overrides]]
+module = ["googleapiclient.*", "google_auth_oauthlib.*", "google.*", "httplib2.*"]
+ignore_missing_imports = true

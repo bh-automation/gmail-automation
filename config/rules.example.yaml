@@ -1,0 +1,76 @@
+# GMAIL-AUTOMATION - Beispielkonfiguration (Kopie als config/rules.yaml anlegen; rules.yaml ist git-ignoriert)
+# APPLY ist hier NICHT einstellbar - nur per CLI-Flag --apply. Senden/Loeschen sind technisch gesperrt.
+config_version: 1
+mode: dry-run                       # einziger erlaubter Wert
+gmail_query: "in:inbox newer_than:30d"
+max_messages_per_run: 100           # harte Obergrenze 1000
+
+confidence:
+  auto: 0.85                        # >= auto: Status-Label/Entwurf unter --apply (Minimum 0.85)
+  review: 0.60                      # 0.60-0.84: REVIEW-Label; < 0.60: REVIEW ohne jede Aenderung
+
+label_prefix: "JARVIS/"
+labels:
+  action: "JARVIS/ACTION"
+  waiting: "JARVIS/WAITING"
+  project: "JARVIS/PROJECT"
+  reference: "JARVIS/REFERENCE"
+  done: "JARVIS/DONE"
+  review: "JARVIS/REVIEW"
+
+capabilities:                       # zweites Tor neben --apply; beides noetig
+  labels: false                     # erst nach gruenem Dry-Run auf true
+  drafts: false                     # Entwuerfe werden nie gesendet
+
+security:                           # Invarianten - andere Werte => Programm verweigert den Start
+  allow_send: false
+  allow_permanent_delete: false
+  forbid_full_mail_scope: true
+
+limits:
+  max_body_chars: 100000
+  max_thread_messages: 200
+  max_raw_body_bytes: 2000000
+
+rules:
+  - id: newsletter
+    state: REFERENCE
+    confidence: 0.90
+    when:
+      header_present: [list-unsubscribe]
+
+  - id: shipping-notice
+    state: REFERENCE
+    confidence: 0.88
+    when:
+      from_domain: [dhl.de, dpd.de, hermesworld.com, gls-pakete.de, ups.com, amazon.de]
+      subject_regex: "(?i)(sendung|paket|versand|zugestellt|shipped|delivery)"
+
+  - id: signature-request
+    state: ACTION
+    confidence: 0.86
+    when:
+      any_regex: ["(?i)\\b(bitte (unterschreiben|unterzeichnen)|unterschrift (erforderlich|benoetigt|benötigt)|signature (requested|required))\\b"]
+      fields: [subject, body]
+    draft_template: ack_received
+
+  - id: waiting-for-reply
+    state: WAITING
+    confidence: 0.86
+    when:
+      newest_is_sent: true
+
+  - id: money-always-review   # Zahlungs-/Kontothemen nie automatisch einsortieren
+    state: REVIEW
+    confidence: 0.70
+    force_review: true
+    when:
+      any_regex: ["(?i)(überweis|ueberweis|zahlung|iban|bankverbindung|payment|invoice|rechnung|mahnung)"]
+
+draft_templates:
+  ack_received: |
+    Hallo,
+
+    vielen Dank fuer Ihre Nachricht. Ich habe sie erhalten und melde mich zeitnah.
+
+    Viele Gruesse

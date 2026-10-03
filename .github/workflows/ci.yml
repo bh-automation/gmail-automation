@@ -1,0 +1,40 @@
+name: safety-ci
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install (pinned runtime + dev tools)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-lock.txt
+          python -m pip install --no-deps -e .
+          python -m pip install "pytest>=8" "ruff>=0.6" "mypy>=1.10" types-PyYAML
+      - name: G1 lint (ruff)
+        run: |
+          python -m ruff check src tests tools
+          python -m ruff format --check src tests tools
+      - name: G1 types (mypy)
+        run: python -m mypy
+      - name: G3 secret scan
+        run: python tools/secret_scan.py
+      - name: G4-G6 forbidden Gmail method scan
+        run: python tools/forbidden_scan.py
+      - name: Config validation
+        run: python -m src.cli config-check --config config/rules.example.yaml
+      - name: G2 tests (offline, no Gmail account, no secrets)
+        env:
+          GMAIL_AUTOMATION_HOME: ${{ runner.temp }}/ga home ä
+        run: python -m pytest

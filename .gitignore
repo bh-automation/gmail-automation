@@ -1,0 +1,38 @@
+# OAuth / secrets - never in Git (they live in %LOCALAPPDATA%\GmailAutomation)
+credentials*.json
+client_secret*.json
+token*.json
+*.meta.json
+.env
+.env.*
+!.env.example
+
+# Local state
+*.db
+*.sqlite
+*.sqlite3
+*.head.json
+*.lock
+logs/
+config/rules.yaml
+
+# Python / tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+*.egg-info/
+build/
+dist/
+.coverage
+
+# Node (optional UI prototype)
+node_modules/
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
