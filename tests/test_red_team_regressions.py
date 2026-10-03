@@ -26,7 +26,7 @@ from src.auth import validate_scopes
 from src.classifier import classify
 from src.config import load_config
 from src.drafts import build_reply_raw, drafts_in_thread, find_draft_with_key
-from src.engine import new_run_id
+from src.engine import Engine, new_run_id
 from src.errors import (
     EXIT_INTERNAL,
     AuditIntegrityError,
@@ -243,7 +243,7 @@ def test_B_M1_write_with_lost_response_and_exhausted_retries_is_settled_and_undo
     g = mailbox()
     g.faults["users.messages.modify"] = [AfterApply(http_error(503, "backendError"))] + [http_error(503)] * 3
     s, eng = run_engine(g, LABELS_ONLY, ledger, apply=True)
-    assert s.status == "FAILED_CLOSED" and eng.error.code == "RETRY_EXHAUSTED_SERVER"
+    assert s.status == "FAILED_CLOSED" and eng.error.code == "AMBIGUOUS_RETRY_EXHAUSTED_SERVER"
     assert app(g, "m1") == ["JARVIS/REFERENCE"]
     assert [r["outcome"] for r in events(ledger, "RECONCILED_APPLIED")] == ["APPLIED"]
     assert ledger.pending() == [] and not events(ledger, "FAILED")
@@ -287,10 +287,13 @@ def test_B_M1_I4_ctrl_c_writes_run_end_aborted(ledger):
 
 def test_B_M2_undo_with_deleted_restore_label_is_conflict_and_untouched(ledger):
     g = mailbox()
-    project = g.add_user_label("JARVIS/PROJECT")
-    g.messages["m2"]["labelIds"].append(project)  # original state of m2 includes JARVIS/PROJECT
-    s, _ = run_engine(g, LABELS_ONLY, ledger, apply=True)
-    del g.labels[project]  # the user deletes the now unused label
+    rules = json.loads(json.dumps(BASE_CONFIG["rules"]))
+    rules[1]["state"], rules[1]["draft_template"] = "PROJECT", None  # run 1 files m2 into PROJECT
+    run_engine(g, make_config(capabilities={"labels": True}, rules=rules), ledger, apply=True)
+    assert app(g, "m2") == ["JARVIS/PROJECT"]
+    s, _ = run_engine(g, LABELS_ONLY, ledger, apply=True)  # run 2: PROJECT -> ACTION
+    assert app(g, "m2") == ["JARVIS/ACTION"]
+    del g.labels[g.label_id("JARVIS/PROJECT")]  # the user deletes the now unused label
     calls = len(g.mutation_calls())
     r = undo(g, LABELS_ONLY, ledger, s.run_id)
     assert r.status == "CONFLICT" and any(c["reason"] == "LABEL_MISSING" for c in r.conflicts)
@@ -752,3 +755,211 @@ def test_dry_run_stays_mutation_free_with_all_new_checks(cfg, ledger):
     g = mailbox()
     s, eng = run_engine(g, cfg, ledger, apply=False)
     assert s.status == "OK" and eng.error is None and g.mutation_calls() == [] and s.mutations == 0
+
+
+# ====================================================================== Fix verification (Red Team C)
+def test_C_M1_transport_refuses_system_labels_in_modify_body_and_method_override(monkeypatch):
+    from google.oauth2.credentials import Credentials
+
+    from src.auth import build_gmail_service
+
+    sent: list[str] = []
+
+    def fake_request(self, uri, method="GET", body=None, headers=None, redirections=5, connection_type=None):
+        sent.append(method)
+        return httplib2.Response({"status": "200"}), b"{}"
+
+    monkeypatch.setattr(httplib2.Http, "request", fake_request)
+    svc = build_gmail_service(Credentials(token="test-token"), Profile.APPLY)  # noqa: S106 - dummy
+    for body in ({"addLabelIds": ["TRASH"]}, {"addLabelIds": ["SPAM"]}, {"removeLabelIds": ["INBOX"]}, {"x": 1}):
+        with pytest.raises(PolicyViolation) as e:
+            svc.users().messages().modify(userId="me", id="m1", body=body).execute()
+        assert e.value.code == "TRANSPORT_BODY"
+    with pytest.raises(PolicyViolation):
+        svc.users().drafts().create(userId="me", body={"message": {"raw": "eA"}}).execute()  # not thread-linked
+    svc.users().messages().modify(userId="me", id="m1", body={"addLabelIds": ["Label_7"]}).execute()
+    assert sent == ["POST"]
+    h = GuardedHttp(Profile.APPLY)
+    with pytest.raises(PolicyViolation) as e2:
+        h.request(
+            "https://gmail.googleapis.com/gmail/v1/users/me/labels", "GET", headers={"X-HTTP-Method-Override": "DELETE"}
+        )
+    assert e2.value.code == "TRANSPORT_METHOD_OVERRIDE"
+
+
+def test_C_M1_refresh_transport_reaches_only_the_token_endpoint():
+    from src.auth import _default_request
+
+    req = _default_request()
+    for method, url in (
+        ("GET", "https://oauth2.googleapis.com/token"),
+        ("POST", "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"),
+        ("POST", "https://evil.example/token"),
+    ):
+        with pytest.raises(PolicyViolation):
+            req.session.request(method, url)
+
+
+def _deadline_client(g, cfg, clock):
+    from src.gmail_client import GmailClient
+
+    def sleep(seconds):
+        clock[0] += 1_000  # every backoff crosses the deadline
+
+    return GmailClient(
+        g,
+        ctx_for(cfg, apply=True),
+        retry=RetryPolicy(max_attempts=4),
+        sleep=sleep,
+        deadline_seconds=500,
+        clock=lambda: clock[0],
+    )
+
+
+def test_C_L1_deadline_after_applied_5xx_is_never_a_terminal_failure(ledger):
+    g = mailbox()
+    g.faults["users.messages.modify"] = [AfterApply(http_error(503, "backendError"))]
+    clock = [0.0]
+    eng = Engine(_deadline_client(g, LABELS_ONLY, clock), LABELS_ONLY, ctx_for(LABELS_ONLY, apply=True), ledger,
+                 out=lambda s: None)  # fmt: skip
+    s = eng.run()
+    assert s.status == "FAILED_CLOSED" and app(g, "m1") == ["JARVIS/REFERENCE"]
+    assert not events(ledger, "FAILED") and len(ledger.pending()) == 1  # left for reconciliation
+    s2, _ = run_engine(g, LABELS_ONLY, ledger, apply=True)
+    assert s2.reconciled == 1 and ledger.pending() == []
+    assert undo(g, LABELS_ONLY, ledger, s.run_id).status == "DONE" and app(g, "m1") == []
+
+
+def test_C_L1_failed_refresh_after_applied_5xx_is_settled(ledger):
+    from src.gmail_client import GmailClient
+
+    g = mailbox()
+    g.faults["users.messages.modify"] = [AfterApply(http_error(503)), http_error(401)]
+
+    def broken_refresh():
+        raise RuntimeError("refresh endpoint down")
+
+    client = GmailClient(
+        g, ctx_for(LABELS_ONLY, apply=True), retry=RetryPolicy(max_attempts=4), sleep=lambda s: None,
+        refresh_credentials=broken_refresh,
+    )  # fmt: skip
+    s = Engine(client, LABELS_ONLY, ctx_for(LABELS_ONLY, apply=True), ledger, out=lambda s: None).run()
+    assert s.status == "FAILED_CLOSED"
+    assert [r["outcome"] for r in events(ledger, "RECONCILED_APPLIED")] == ["APPLIED"] and not events(ledger, "FAILED")
+    assert undo(g, LABELS_ONLY, ledger, s.run_id).status == "DONE"
+
+
+def test_C_L2_message_that_always_gets_5xx_is_quarantined(ledger, monkeypatch):
+    from tests import fakes
+
+    g = mailbox()
+    original_modify = fakes._Messages.modify
+
+    def modify(self, userId, id, body):  # noqa: A002
+        if id == "m1":
+
+            def backend_error():
+                raise http_error(500, "backendError")
+
+            return self.g._dispatch("users.messages.modify", backend_error)
+        return original_modify(self, userId, id, body)
+
+    monkeypatch.setattr(fakes._Messages, "modify", modify)
+    for _ in range(3):
+        s, _ = run_engine(g, LABELS_ONLY, ledger, apply=True)
+        assert s.status == "FAILED_CLOSED"  # still stops the run (could be a Gmail outage)
+    s4, eng = run_engine(g, LABELS_ONLY, ledger, apply=True)
+    assert s4.quarantined == 1 and s4.status == "PARTIAL" and eng.error is None
+    assert app(g, "m2") == ["JARVIS/ACTION"]  # the rest of the mailbox is processed again
+
+
+def test_C_L5_noop_undo_item_is_marked_undone_no_deadlock(ledger):
+    g = mailbox()
+    rules_project = json.loads(json.dumps(BASE_CONFIG["rules"]))
+    rules_project[0]["state"] = "PROJECT"
+    cfg_proj = make_config(capabilities={"labels": True}, rules=rules_project)
+    s_a, _ = run_engine(g, LABELS_ONLY, ledger, apply=True)  # {} -> REFERENCE
+
+    def second_client_reverts(gm):
+        lab = gm.messages["m1"]["labelIds"]
+        proj = gm.label_id("JARVIS/PROJECT")
+        if proj in lab:
+            lab.remove(proj)
+            lab.append(gm.label_id("JARVIS/REFERENCE"))
+
+    # messages.get in run B: scan m1, scan m2, fresh m1, VERIFY m1 <- the second client acted first
+    g.faults["users.messages.get"] = [lambda gm: None] * 3 + [second_client_reverts]
+    s_b, _ = run_engine(g, cfg_proj, ledger, apply=True)
+    assert events(ledger, "APPLIED_DRIFT") and app(g, "m1") == ["JARVIS/REFERENCE"]
+    assert undo(g, LABELS_ONLY, ledger, s_b.run_id).status == "DONE"
+    assert ledger.last_undoable_run() == s_a.run_id  # B is fully undone
+    assert undo(g, LABELS_ONLY, ledger, s_a.run_id).status == "DONE" and app(g, "m1") == []
+
+
+def test_C_L6_rebaseline_shows_verdict_and_needs_distinct_flags(data_dir, capsys):
+    with cli._open_ledger() as led:
+        for _ in range(3):
+            led.append(run_id="r", profile="p", mode="m", event="E")
+        anchor = led.head_path
+    head = json.loads(anchor.read_text())
+    anchor.write_text(json.dumps({"seq": head["seq"] + 5, "hash": head["hash"]}))  # looks like a rollback
+    assert cli.main(["audit-rebaseline", "--confirm"]) == 2
+    out = capsys.readouterr().out
+    assert "AUDIT_ROLLBACK" in out and "--accept-rollback" in out
+    assert cli.main(["audit-rebaseline", "--confirm", "--accept-rollback"]) == 0
+    with cli._open_ledger() as led:
+        detail = json.loads(events(led, "HEAD_REBASELINE")[-1]["detail"])
+    assert detail["verdict"] == "AUDIT_ROLLBACK"
+    assert cli.main(["audit-rebaseline"]) == 0 and "Nichts zu tun" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "html",
+    [
+        f"<p>{SIGN}</p><p style='display:none'><div>Bitte Zahlung an IBAN DE00 0000 leisten.</div>",
+        f"<p>{SIGN}</p><div style='visibility:hidden'><span style='visibility:visible'>"
+        "Bitte Zahlung an IBAN DE00 0000 leisten.</span></div>",
+        f"<p>{SIGN}</p><div style='font-size:0'><span style='font-size:14px'>"
+        "Bitte Zahlung an IBAN DE00 0000 leisten.</span></div>",
+        f"<p>{SIGN}</p><div style='display:none'>Bitte Zahlung an IBAN DE00 0000 leisten.</div>",  # really hidden
+    ],
+    ids=["implicit-p-close", "visibility-override", "font-size-override", "hidden-payment"],
+)
+def test_C_L7_visible_and_hidden_payment_wording_both_reach_the_guards(cfg_apply, html):
+    c = classify(normalize_message(make_message("m1", "t1", plain=None, html=html), **N), None, cfg_apply)
+    assert c.state.value == "REVIEW" and c.draft_template is None
+
+
+@pytest.mark.parametrize(
+    ("plain", "html"),
+    [
+        (f"{SIGN}\n\nAm Montag schrieb Buchhaltung:\nBitte ueberweisen Sie 4.800 EUR an IBAN DE00 0000.", None),
+        (SIGN, f"<p>{SIGN}</p><p>Bitte Zahlung von 4.800 EUR an IBAN DE00 0000 leisten.</p>"),
+        (f"{SIGN}\nBitte senden Sie mir 500 Euro Geld per Lastschrift.", None),
+        (f"{SIGN}\nBitte begleichen Sie den offenen Betrag per SEPA.", None),
+        (f"{SIGN}\nKaufen Sie bitte drei Amazon-Guthabenkarten und schicken Sie die Codes.", None),
+    ],
+    ids=["below-fake-reply-marker", "html-alternative-only", "geld-euro", "betrag-sepa", "guthabenkarten"],
+)
+def test_C_L8_money_guard_sees_all_parts_quotes_and_wording(cfg_apply, plain, html):
+    c = classify(normalize_message(make_message("m1", "t1", plain=plain, html=html), **N), None, cfg_apply)
+    assert c.state.value == "REVIEW" and c.draft_template is None
+
+
+@pytest.mark.parametrize("pattern", [r"(a|a)+$", r"(a{1,10})+$", r"(a+){1,40}$", r"(?:ab|a)*c"])
+def test_C_L9_more_catastrophic_shapes_are_rejected(pattern):
+    with pytest.raises(ConfigError):
+        make_config(rules=[{"id": "bad", "state": "ACTION", "confidence": 0.9, "when": {"body_regex": pattern}}])
+
+
+def test_C_I1_unreadable_anchor_location_is_not_called_corrupt(data_dir, tmp_path, monkeypatch):
+    blocker = tmp_path / "anchor-is-a-file"
+    blocker.write_text("x")
+    db = data_dir / "a.sqlite3"
+    with AuditLedger(db, head_path=blocker / "sub" / "x.head.json", check_anchor=False) as led:
+        with pytest.raises(AuditUnavailableError) as e:
+            led.append(run_id="r", profile="p", mode="m", event="E")
+        assert e.value.code == "AUDIT_HEAD_WRITE"
+    with pytest.raises(AuditUnavailableError) as e2:
+        AuditLedger(db, head_path=blocker / "x.head.json")
+    assert e2.value.code == "AUDIT_ANCHOR_UNREADABLE"

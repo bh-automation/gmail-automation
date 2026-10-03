@@ -104,6 +104,18 @@ PLANTED = {
     "rt_requests.py": "import requests\ndef go():\n    return requests.post('https://example.invalid')\n",
     "rt_bare_google.py": "import google.auth\ndef go():\n    return google.auth\n",
     "rt_vars.py": "def go(m):\n    return vars(m)['se' 'nd']\n",
+    # Fix verification C-M1: indirect transport access and aliasing
+    "rc_rel_adapter_httplib2.py": "from .gmail_client import httplib2\n",
+    "rc_rel_retry_socket.py": "from .retry import http, socket, ssl\n",
+    "rc_abs_src_httplib2.py": "from src.gmail_client import httplib2\n",
+    "rc_auth_default_request.py": "from .auth import _default_request\n",
+    "rc_sys_modules.py": "import sys\nT = sys.modules['httplib2']\n",
+    "rc_importlib_util.py": "import importlib.util\nS = importlib.util.find_spec('requests')\n",
+    "rc_getattr_alias.py": "g = getattr\ndef go(m, n):\n    return g(m, n)\n",
+    "rc_operator_alias.py": "from operator import attrgetter as ag\n",
+    "rc_adapter_root.py": "def go(c):\n    return c._root\n",
+    "rc_subprocess.py": "import subprocess\n",
+    "rc_service_factory.py": "from .auth import build_gmail_service\n",
 }
 
 

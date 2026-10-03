@@ -242,7 +242,7 @@ def test_poison_message_is_quarantined_after_three_failures(cfg_apply, ledger, m
         s, _ = run_engine(g, cfg_apply, ledger, apply=True)
         statuses.append((s.status, s.message_failures, s.quarantined))
     assert statuses[:3] == [("PARTIAL", 1, 0)] * 3
-    assert statuses[3] == ("OK", 0, 1)  # 4th run: quarantined, no further attempt
+    assert statuses[3] == ("PARTIAL", 0, 1)  # 4th run: quarantined (no attempt) - still reported, exit 9
     assert "JARVIS/ACTION" in g.label_names("m2")  # the rest of the mailbox was processed
     assert ledger.quarantined(["API_CLIENT", "API_NOT_FOUND", "API_CONFLICT"], 3) == ["m1"]
     eng_retry = Engine(
@@ -469,13 +469,25 @@ def test_html_only_and_empty_messages_do_not_crash(cfg_apply, ledger):
     assert "JARVIS/ACTION" in g.label_names("h1")
 
 
-def test_foreign_user_labels_are_never_touched(cfg_apply, ledger):
+def test_foreign_user_labels_are_never_touched(ledger):
     g = mailbox()
     steuer = g.add_user_label("Privat/Steuer")
     g.messages["m1"]["labelIds"].append(steuer)
-    old_action = g.add_user_label("JARVIS/ACTION")
-    g.messages["m1"]["labelIds"].append(old_action)
-    run_engine(g, cfg_apply, ledger, apply=True)
+    rules = [dict(r) for r in cfg1_rules()]
+    rules[0] = {**rules[0], "state": "ACTION"}  # first the newsletter rule files into ACTION ...
+    run_engine(g, make_config(capabilities={"labels": True}, rules=rules), ledger, apply=True)
+    assert "JARVIS/ACTION" in g.label_names("m1")
+    run_engine(g, make_config(capabilities={"labels": True}), ledger, apply=True)  # ... then into REFERENCE
     names = g.label_names("m1")
     assert "Privat/Steuer" in names and "INBOX" in names
     assert "JARVIS/REFERENCE" in names and "JARVIS/ACTION" not in names  # state label replaced, not stacked
+
+
+def test_app_label_set_by_a_person_before_first_run_is_kept(cfg_apply, ledger):
+    """Fix verification C-L4: app labels present on first contact are a human decision."""
+    g = mailbox()
+    done = g.add_user_label("JARVIS/DONE")
+    g.messages["m1"]["labelIds"].append(done)
+    s, _ = run_engine(g, cfg_apply, ledger, apply=True)
+    assert s.human_override == 1
+    assert sorted(n for n in g.label_names("m1") if n.startswith("JARVIS/")) == ["JARVIS/DONE"]
