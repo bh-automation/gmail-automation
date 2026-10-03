@@ -1,17 +1,25 @@
 """Error classification and bounded retry policy for Gmail API calls.
 
 401 -> exactly one explicit credential refresh, then fail (no refresh loop)
-403 -> permission/scope problem: fail closed immediately (rate-limit 403s count as 429)
+403 -> permission/scope problem: fail closed immediately (rate-limit 403s count as 429,
+       an exhausted daily quota is reported as QUOTA and not retried)
 429 / 5xx / network -> exponential backoff with jitter, Retry-After honoured, bounded
-Non-idempotent writes are never retried blindly - the caller reconciles instead.
+       per call (max attempts) and per run (cumulative backoff budget)
+Non-idempotent writes are never retried blindly after 5xx/network errors - the caller
+reconciles instead. A 429 means "rejected, not executed" and is retried for them too.
 """
 
 from __future__ import annotations
 
+import errno
+import http.client
 import json
 import random
 import socket
+import ssl
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from typing import Any
 
@@ -25,11 +33,24 @@ class ErrorKind(StrEnum):
     NOT_FOUND = "NOT_FOUND"
     CONFLICT = "CONFLICT"
     CLIENT = "CLIENT"
+    QUOTA = "QUOTA"
     UNKNOWN = "UNKNOWN"
 
 
 TRANSIENT = frozenset({ErrorKind.RATE_LIMIT, ErrorKind.SERVER, ErrorKind.NETWORK})
 _RATE_REASONS = {"ratelimitexceeded", "userratelimitexceeded", "quotaexceeded"}
+_QUOTA_REASONS = {"dailylimitexceeded", "dailylimitexceededunreg"}
+_NET_ERRNOS = frozenset(
+    {
+        errno.ENETUNREACH,
+        errno.EHOSTUNREACH,
+        errno.ECONNABORTED,
+        errno.ECONNRESET,
+        errno.ECONNREFUSED,
+        errno.ETIMEDOUT,
+        errno.ENETDOWN,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -52,14 +73,33 @@ def _http_reason(content: Any) -> str:
         return ""
 
 
-def _retry_after(resp: Any) -> float | None:
+def _retry_after(resp: Any, now: datetime | None = None) -> float | None:
     try:
         value = resp.get("retry-after") if hasattr(resp, "get") else None
         if value is None:
             return None
-        return max(0.0, float(value))
-    except (TypeError, ValueError):
+        try:
+            return max(0.0, float(value))
+        except ValueError:
+            when = parsedate_to_datetime(str(value))  # HTTP-date form (RFC 9110)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=UTC)
+            return max(0.0, (when - (now or datetime.now(UTC))).total_seconds())
+    except (TypeError, ValueError, IndexError, OverflowError):
         return None
+
+
+def is_network_error(exc: BaseException) -> bool:
+    import httplib2
+
+    if isinstance(
+        exc,
+        TimeoutError | ConnectionError | socket.timeout | socket.gaierror | ssl.SSLError | http.client.HTTPException,
+    ):
+        return True
+    if isinstance(exc, httplib2.HttpLib2Error):
+        return True
+    return isinstance(exc, OSError) and exc.errno in _NET_ERRNOS
 
 
 def classify(exc: BaseException) -> ErrorInfo:
@@ -73,7 +113,14 @@ def classify(exc: BaseException) -> ErrorInfo:
         if status == 401:
             kind = ErrorKind.AUTH
         elif status == 403:
-            kind = ErrorKind.RATE_LIMIT if reason.lower() in _RATE_REASONS else ErrorKind.PERMISSION
+            low = reason.lower()
+            kind = (
+                ErrorKind.QUOTA
+                if low in _QUOTA_REASONS
+                else ErrorKind.RATE_LIMIT
+                if low in _RATE_REASONS
+                else ErrorKind.PERMISSION
+            )
         elif status == 404:
             kind = ErrorKind.NOT_FOUND
         elif status == 409:
@@ -91,10 +138,7 @@ def classify(exc: BaseException) -> ErrorInfo:
     if isinstance(exc, RefreshError):
         return ErrorInfo(ErrorKind.AUTH, None, "refresh_error", None)
 
-    import httplib2
-
-    net_types: tuple[type[BaseException], ...] = (TimeoutError, ConnectionError, socket.timeout, httplib2.HttpLib2Error)
-    if isinstance(exc, net_types):
+    if is_network_error(exc):
         return ErrorInfo(ErrorKind.NETWORK, None, type(exc).__name__, None)
     return ErrorInfo(ErrorKind.UNKNOWN, None, type(exc).__name__, None)
 
@@ -105,6 +149,7 @@ class RetryPolicy:
     base_delay: float = 1.0
     max_delay: float = 32.0
     max_retry_after: float = 60.0
+    max_total_sleep: float = 300.0  # cumulative backoff budget per client (= per run)
 
     def delay(self, attempt: int, retry_after: float | None, jitter: float | None = None) -> float:
         j = random.random() if jitter is None else jitter  # noqa: S311 - jitter, not security

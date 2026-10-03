@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import os
 import stat
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -63,15 +63,18 @@ PROFILE_SCOPES: dict[Profile, ScopeProfile] = {
 assert not any(s in FORBIDDEN_SCOPES for p in PROFILE_SCOPES.values() for s in p.allowed)  # noqa: S101
 
 
-def _normalize(scopes: Iterable[str] | str | None) -> frozenset[str]:
+def _normalize(scopes: Any) -> frozenset[str]:
+    """Accept only None, a space-separated string or a list/tuple/set of strings; anything else fails closed."""
     if scopes is None:
         return frozenset()
     if isinstance(scopes, str):
         scopes = scopes.split()
+    if not isinstance(scopes, list | tuple | set | frozenset) or not all(isinstance(s, str) for s in scopes):
+        raise ScopeError("Granted scopes have an unexpected format - refusing to continue", code="SCOPE_FORMAT")
     return frozenset(s.strip() for s in scopes if s and s.strip())
 
 
-def validate_scopes(profile: Profile, granted: Iterable[str] | str | None) -> frozenset[str]:
+def validate_scopes(profile: Profile, granted: Any) -> frozenset[str]:
     """Fail closed unless required <= granted <= allowed and nothing forbidden is present."""
     g = _normalize(granted)
     spec = PROFILE_SCOPES[profile]
@@ -114,6 +117,12 @@ def check_secret_location(path: Path, *, project_root: Path = PROJECT_ROOT, must
         if mode & 0o077:
             raise SecretLocationError(
                 f"{p.name} is readable by other users (mode {oct(mode)}); chmod 600", code="SECRET_PERMISSIONS"
+            )
+        parent_mode = stat.S_IMODE(resolved.parent.stat().st_mode)
+        if parent_mode & 0o022:
+            raise SecretLocationError(
+                f"Folder of {p.name} is writable by other users (mode {oct(parent_mode)}); chmod 700",
+                code="SECRET_DIR_PERMISSIONS",
             )
     return resolved
 
@@ -262,7 +271,26 @@ def run_consent_flow(
     return granted
 
 
-def build_gmail_service(creds: Any) -> Any:
+def make_refresher(creds: Any) -> Callable[[], None]:
+    """Explicit single credential refresh used by GmailClient after a 401 (token endpoint only)."""
+
+    def refresh() -> None:
+        creds.refresh(_default_request())
+
+    return refresh
+
+
+def build_gmail_service(creds: Any, profile: Profile) -> Any:
+    """googleapiclient service whose ONLY transport is the allow-listing GuardedHttp.
+
+    Transport-level 401 auto-refresh is disabled (refresh_status_codes=()), so GmailClient's
+    single explicit refresh is the only 401-driven refresh. Expiry-based refresh before a
+    request still works and goes through the guarded transport to the token endpoint.
+    """
+    from google_auth_httplib2 import AuthorizedHttp
     from googleapiclient.discovery import build
 
-    return build("gmail", "v1", credentials=creds, cache_discovery=False, static_discovery=True)
+    from .gmail_client import GuardedHttp
+
+    authed = AuthorizedHttp(creds, http=GuardedHttp(profile), refresh_status_codes=())
+    return build("gmail", "v1", http=authed, cache_discovery=False, static_discovery=True)

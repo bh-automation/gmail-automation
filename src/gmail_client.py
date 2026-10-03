@@ -1,29 +1,40 @@
 """Narrow Gmail adapter with an allow-listed endpoint surface.
 
-Two independent barriers stand between any code path and a dangerous Gmail call:
+Three independent barriers stand between a code path and a dangerous Gmail call:
 
 1. `_GuardedResource` wraps the googleapiclient service. Every attribute access is
-   checked against the profile's endpoint allow-list BEFORE the request is even built.
-   send / delete / trash / batch / settings / forwarding / filters cannot be reached -
-   not even by code that monkey-patches new methods onto `GmailClient`.
+   checked against the profile's endpoint allow-list BEFORE the request is even built,
+   so send / delete / trash / batch / settings / forwarding / filters are unreachable
+   through `GmailClient`.
 2. Every public mutation method calls `policy.authorize()` first.
+3. `GuardedHttp` is the HTTP transport of the real service: it checks method + host +
+   path of EVERY outgoing request against the same allow-list (also covers requests
+   built outside `GmailClient` on the shared transport, and token refreshes).
 
-The public surface exposes no send, delete, trash, forward or settings method at all.
+Trust assumption: these are in-process controls. They stop accidental, generated or
+naive misuse; they cannot stop malicious code running in the same interpreter (a
+compromised dependency). The static gate (tools/forbidden_scan.py) keeps new transport
+or reflection paths out of the code base.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Final
+from urllib.parse import urlsplit
+
+import httplib2
 
 from .errors import (
     AmbiguousWriteError,
     AuthError,
     GmailApiError,
     PolicyViolation,
+    RunBudgetExceeded,
     ScopeError,
     TransientExhaustedError,
 )
@@ -92,6 +103,67 @@ FORBIDDEN_METHOD_NAMES: Final = frozenset(
     }
 )
 NON_IDEMPOTENT: Final = frozenset({"users.drafts.create", "users.labels.create"})
+
+# ---------------------------------------------------------------------- transport allow-list
+_ID = r"[A-Za-z0-9_\-]{1,256}"
+_BASE = r"/gmail/v1/users/me"
+GMAIL_HOSTS: Final = frozenset({"gmail.googleapis.com", "gmail.mtls.googleapis.com"})
+TOKEN_HOST: Final = "oauth2.googleapis.com"  # noqa: S105 - host name of the OAuth endpoint, not a secret
+TRANSPORT_RULES: Final[tuple[tuple[str, str, re.Pattern[str]], ...]] = (
+    ("users.getProfile", "GET", re.compile(_BASE + r"/profile")),
+    ("users.labels.list", "GET", re.compile(_BASE + r"/labels")),
+    ("users.labels.create", "POST", re.compile(_BASE + r"/labels")),
+    ("users.messages.list", "GET", re.compile(_BASE + r"/messages")),
+    ("users.messages.get", "GET", re.compile(_BASE + r"/messages/" + _ID)),
+    ("users.messages.modify", "POST", re.compile(_BASE + r"/messages/" + _ID + r"/modify")),
+    ("users.threads.get", "GET", re.compile(_BASE + r"/threads/" + _ID)),
+    ("users.drafts.list", "GET", re.compile(_BASE + r"/drafts")),
+    ("users.drafts.get", "GET", re.compile(_BASE + r"/drafts/" + _ID)),
+    ("users.drafts.create", "POST", re.compile(_BASE + r"/drafts")),
+)
+
+
+def check_transport(method: str, uri: str, allowed: frozenset[str]) -> str:
+    """Raise PolicyViolation unless an outgoing HTTP request maps to an allow-listed endpoint."""
+    parts = urlsplit(str(uri))
+    verb = str(method).upper()
+    clean = parts.scheme == "https" and parts.port in (None, 443) and not parts.username and not parts.password
+    if clean and parts.hostname == TOKEN_HOST and parts.path == "/token" and verb == "POST" and not parts.query:
+        return "oauth2.token"  # credential refresh
+    if not clean or parts.hostname not in GMAIL_HOSTS:
+        raise PolicyViolation(f"Outgoing request to unexpected host blocked: {parts.hostname}", code="TRANSPORT_HOST")
+    for endpoint, rule_verb, rx in TRANSPORT_RULES:
+        if verb == rule_verb and rx.fullmatch(parts.path):
+            if endpoint not in allowed:
+                raise PolicyViolation(f"Transport: {endpoint} not allowed for this profile", code="TRANSPORT_DENIED")
+            return endpoint
+    raise PolicyViolation(
+        f"Outgoing Gmail request blocked at transport layer: {verb} {parts.path}", code="TRANSPORT_BLOCKED"
+    )
+
+
+class GuardedHttp(httplib2.Http):
+    """httplib2 transport that only lets allow-listed Gmail requests (and token refreshes) out."""
+
+    def __init__(self, profile: Profile, *, timeout: float = 60.0) -> None:
+        super().__init__(timeout=timeout)
+        self.transport_allowed = allowed_endpoints(profile)
+        self.follow_redirects = False  # a redirect could point outside the allow-list
+        self.redirect_codes = frozenset(httplib2.REDIRECT_CODES) - {308}
+
+    def request(
+        self,
+        uri: str,
+        method: str = "GET",
+        body: Any = None,
+        headers: Any = None,
+        redirections: int = httplib2.DEFAULT_MAX_REDIRECTS,
+        connection_type: Any = None,
+    ) -> Any:
+        check_transport(method, uri, self.transport_allowed)
+        return super().request(
+            uri, method, body=body, headers=headers, redirections=redirections, connection_type=connection_type
+        )
 
 
 def allowed_endpoints(profile: Profile) -> frozenset[str]:
@@ -211,6 +283,8 @@ class GmailClient:
         sleep: Callable[[float], None] = time.sleep,
         refresh_credentials: Callable[[], None] | None = None,
         user_id: str = "me",
+        deadline_seconds: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._ctx = ctx
         self._root = _GuardedResource(service, "", allowed_endpoints(ctx.profile))
@@ -218,6 +292,9 @@ class GmailClient:
         self._sleep = sleep
         self._refresh = refresh_credentials
         self._user = user_id
+        self._clock = clock
+        self._deadline = clock() + deadline_seconds if deadline_seconds else None
+        self._slept = 0.0
         self.mutation_count = 0
         self.call_log: list[str] = []
 
@@ -235,6 +312,8 @@ class GmailClient:
         attempt = 0
         while True:
             attempt += 1
+            if self._deadline is not None and self._clock() > self._deadline:
+                raise RunBudgetExceeded("Run deadline exceeded - stopped before the next request", code="RUN_DEADLINE")
             request = factory()  # building the request passes the guard again
             self.call_log.append(endpoint)
             try:
@@ -259,8 +338,15 @@ class GmailClient:
                     raise ScopeError(
                         f"Gmail denied {endpoint} (403 {info.reason or 'forbidden'}) - fail closed", code="AUTH_403"
                     ) from None
+                if info.kind is ErrorKind.QUOTA:
+                    raise GmailApiError(
+                        f"Gmail API daily quota exhausted on {endpoint} - try again tomorrow",
+                        code="API_QUOTA_DAILY",
+                        status=info.status,
+                    ) from None
                 if info.kind in TRANSIENT:
-                    if mutating and endpoint in NON_IDEMPOTENT:
+                    # 429 / rate-limit 403 = rejected, not executed: safe to retry even for creates.
+                    if mutating and endpoint in NON_IDEMPOTENT and info.kind is not ErrorKind.RATE_LIMIT:
                         raise AmbiguousWriteError(
                             f"{endpoint} outcome unknown ({info.kind.value})",
                             code=f"AMBIGUOUS_{info.kind.value}",
@@ -273,7 +359,14 @@ class GmailClient:
                             status=info.status,
                         ) from None
                     delay = self._retry.delay(attempt, info.retry_after)
+                    if self._slept + delay > self._retry.max_total_sleep:
+                        raise TransientExhaustedError(
+                            f"{endpoint}: backoff budget of the run exhausted ({info.kind.value})",
+                            code=f"RETRY_BUDGET_{info.kind.value}",
+                            status=info.status,
+                        ) from None
                     log.warning("transient %s on %s, retry %d in %.1fs", info.kind.value, endpoint, attempt, delay)
+                    self._slept += delay
                     self._sleep(delay)
                     continue
                 raise GmailApiError(
@@ -294,7 +387,10 @@ class GmailClient:
         refs: list[dict[str, str]] = []
         token: str | None = None
         pages = 0
-        while len(refs) < limit:
+        max_pages = -(-limit // page_size) + 2  # bounded even if the API keeps returning tokens
+        seen_tokens: set[str] = set()
+        empty_pages = 0
+        while len(refs) < limit and pages < max_pages:
             size = min(page_size, limit - len(refs))
             tok = token
 
@@ -306,12 +402,15 @@ class GmailClient:
 
             res = self._execute("users.messages.list", factory)
             pages += 1
+            before = len(refs)
             for m in res.get("messages", []) or []:
                 if isinstance(m, dict) and m.get("id") and m.get("threadId"):
                     refs.append({"id": str(m["id"]), "threadId": str(m["threadId"])})
+            empty_pages = empty_pages + 1 if len(refs) == before else 0
             token = res.get("nextPageToken")
-            if not token:
+            if not token or not isinstance(token, str) or token in seen_tokens or empty_pages >= 2:
                 break
+            seen_tokens.add(token)
         return refs[:limit], pages
 
     def get_message(self, message_id: str, fmt: str = "full") -> dict[str, Any]:
@@ -332,11 +431,30 @@ class GmailClient:
             )
         )
 
-    def list_drafts(self, max_results: int = 100) -> list[dict[str, Any]]:
-        res = self._execute(
-            "users.drafts.list", lambda: self._users().drafts().list(userId=self._user, maxResults=max_results)
-        )
-        return list(res.get("drafts", []) or [])
+    def list_drafts(self, max_results: int = 100, page_token: str | None = None) -> tuple[list[dict[str, Any]], str]:
+        def factory() -> Any:
+            kw: dict[str, Any] = {"userId": self._user, "maxResults": max_results}
+            if page_token:
+                kw["pageToken"] = page_token
+            return self._users().drafts().list(**kw)
+
+        res = self._execute("users.drafts.list", factory)
+        token = res.get("nextPageToken")
+        return list(res.get("drafts", []) or []), token if isinstance(token, str) else ""
+
+    def list_all_drafts(self, max_pages: int = 40) -> list[dict[str, Any]]:
+        """All drafts (paginated, bounded). Missing an own draft would create a duplicate."""
+        out: list[dict[str, Any]] = []
+        token: str | None = None
+        seen: set[str] = set()
+        for _ in range(max_pages):
+            page, nxt = self.list_drafts(max_results=500, page_token=token)
+            out.extend(d for d in page if isinstance(d, dict))
+            if not nxt or nxt in seen:
+                return out
+            seen.add(nxt)
+            token = nxt
+        raise GmailApiError("Too many drafts to check for duplicates safely", code="DRAFTS_TOO_MANY")
 
     def get_draft_headers(self, draft_id: str) -> dict[str, str]:
         res = self._execute(
