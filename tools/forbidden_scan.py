@@ -11,7 +11,10 @@ real code (strings/comments removed). Flags:
 * transport and credential modules (googleapiclient.discovery/http, google.auth.transport,
   google.oauth2, google_auth_httplib2, requests, httplib2, urllib.request, urllib3, http.client,
   socket, ssl, aiohttp, httpx) outside the adapter/auth modules - a second, unguarded service
-  or raw REST call cannot be written anywhere else;
+  or raw REST call cannot be written anywhere else - and re-imports of such objects or of
+  private names from project modules (`from .gmail_client import httplib2`);
+* code-loading escape hatches (importlib.util, runpy, pkgutil, inspect, ctypes, builtins,
+  subprocess, sys.modules) and reflective builtins used as values (`g = getattr`);
 * string constants (also constant-folded concatenations, joins and f-strings) containing the
   full-mail scope or a raw Gmail REST URL.
 
@@ -80,11 +83,54 @@ RESTRICTED_MODULES = (
     "aiohttp",
     "httpx",
     "pycurl",
+    # reflection / code loading / process escape hatches
+    "importlib.util",
+    "importlib.machinery",
+    "importlib.import_module",
+    "runpy",
+    "pkgutil",
+    "inspect",
+    "ctypes",
+    "marshal",
+    "builtins",
+    "subprocess",
+    "multiprocessing",
+    "operator.attrgetter",
+    "operator.methodcaller",
+    "sys.modules",
 )
-# Exception-type imports that are harmless without a credential object.
-FILE_ALLOWED_MODULES = {"src/retry.py": {"googleapiclient.errors", "httplib2", "socket", "ssl", "http.client"}}
-BARE_PACKAGES = {"googleapiclient", "google", "google.auth"}  # `import google.auth` then `.transport...`
+# Exception-type imports that are harmless without a credential object; fixed tool subprocesses.
+FILE_ALLOWED_MODULES = {
+    "src/retry.py": {"googleapiclient.errors", "httplib2", "socket", "ssl", "http.client"},
+    "src/cli.py": {"subprocess"},
+    "tools/secret_scan.py": {"subprocess"},
+}
+BARE_PACKAGES = {"googleapiclient", "google", "google.auth", "importlib"}  # sub-modules would bypass the gate
+# Names that must not be re-imported from project modules (transport objects, credential factories).
+INTERNAL_RESTRICTED = {
+    "httplib2",
+    "socket",
+    "ssl",
+    "http",
+    "requests",
+    "urllib3",
+    "build",
+    "AuthorizedHttp",
+    "AuthorizedSession",
+    "Credentials",
+    "Request",
+    "GuardedHttp",
+    "load_credentials",
+    "make_refresher",
+    "build_gmail_service",
+    "run_consent_flow",
+}
+INTERNAL_ALLOWED = {
+    "src/cli.py": {"load_credentials", "make_refresher", "build_gmail_service", "run_consent_flow"},
+    "src/auth.py": {"GuardedHttp"},
+}
 REFLECTION_CALLS = {"eval", "exec", "compile", "vars", "globals", "__import__", "import_module", "breakpoint"}
+REFLECTIVE_BUILTINS = {"getattr", "setattr", "delattr", "eval", "exec", "compile", "vars", "globals", "locals"}
 DUNDER_ATTRS = {"__getattr__", "__getattribute__", "__dict__", "__builtins__", "__subclasses__", "__globals__"}
 GREP = re.compile(r"messages\(\)\.send|drafts\(\)\.send|messages\(\)\.delete|threads\(\)\.delete|batchDelete")
 
@@ -132,6 +178,7 @@ class Scanner(ast.NodeVisitor):
         self.func_stack: list[str] = []
         self.exempt_assignment = False
         self.adapter = self.rel in ADAPTER_FILES
+        self.call_funcs: set[int] = set()
 
     def _exempt(self) -> bool:
         return any((self.rel, f) in EXEMPT_FUNCS for f in self.func_stack)
@@ -166,16 +213,28 @@ class Scanner(ast.NodeVisitor):
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:  # noqa: N802
         module = node.module or ""
+        internal = node.level > 0 or module == "src" or module.startswith("src.")
         if node.level == 0:
             self._check_module(node, module)
             for alias in node.names:
                 self._check_module(node, f"{module}.{alias.name}")
+        if internal and not self.adapter:
+            for alias in node.names:
+                name = alias.name
+                private = name.startswith("_") and not (name.startswith("__") and name.endswith("__"))
+                allowed = name in INTERNAL_ALLOWED.get(self.rel, set())
+                if (private or name in INTERNAL_RESTRICTED) and not allowed:
+                    self._flag(node, f"re-import of '{name}' from a project module (transport/credential leak)")
         self.generic_visit(node)
 
     # -- attributes / names ----------------------------------------------------------
     def visit_Attribute(self, node: ast.Attribute) -> None:  # noqa: N802
         if node.attr in FORBIDDEN_NAMES:
             self._flag(node, f"attribute access '.{node.attr}'")
+        if node.attr == "modules" and isinstance(node.value, ast.Name) and node.value.id == "sys":
+            self._flag(node, "sys.modules access (module table reflection)")
+        if node.attr in {"_root", "_g_inner"} and self.rel != ADAPTER:
+            self._flag(node, f"access to adapter internals '.{node.attr}'")
         if node.attr in DUNDER_ATTRS and self.rel != ADAPTER:
             self._flag(node, f"reflective dunder '.{node.attr}' outside the adapter")
         self.generic_visit(node)
@@ -183,10 +242,13 @@ class Scanner(ast.NodeVisitor):
     def visit_Name(self, node: ast.Name) -> None:  # noqa: N802
         if node.id == "__builtins__":
             self._flag(node, "access to __builtins__")
+        if node.id in REFLECTIVE_BUILTINS and id(node) not in self.call_funcs and self.rel != ADAPTER:
+            self._flag(node, f"reflective builtin '{node.id}' used as a value (aliasing)")
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
         fn = node.func
+        self.call_funcs.add(id(fn))
         name = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else ""
         if name in {"getattr", "attrgetter", "methodcaller", "__getattribute__", "__getattr__", "setattr", "hasattr"}:
             name_args = node.args[1:2] if name in {"getattr", "setattr", "hasattr"} else node.args[:1]
