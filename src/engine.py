@@ -1,8 +1,15 @@
 """Run orchestration: scan -> classify -> plan -> authorise -> execute -> verify -> audit.
 
 The classifier only returns data; this module turns it into typed PlannedActions and
-hands each one through the policy-gated adapter. Any mutation failure stops the run
-(fail closed). Already-applied changes stay audited and undoable.
+hands each one through the policy-gated adapter.
+
+Failure handling (fail closed, but no single poison message blocks everything):
+* global errors (auth, scope, policy, audit, retries exhausted, budget, unknown) stop the run;
+* message-scoped errors (400/404/409 for one message) are audited as FAILED and the run
+  continues; after QUARANTINE_AFTER consecutive failures a message is quarantined;
+* a write whose outcome is unknown is re-read and settled immediately, or left PENDING
+  for reconciliation - it is never recorded as a terminal FAILED if it may have happened;
+* a change the human made after this program's last change wins (SKIPPED_HUMAN_OVERRIDE).
 """
 
 from __future__ import annotations
@@ -19,7 +26,15 @@ from .audit import AuditLedger
 from .classifier import classify
 from .config import Config
 from .drafts import build_reply_raw, drafts_in_thread, find_draft_with_key
-from .errors import AmbiguousWriteError, FailClosed, GmailApiError, GmailAutomationError, PolicyViolation
+from .errors import (
+    AmbiguousWriteError,
+    FailClosed,
+    GmailApiError,
+    GmailAutomationError,
+    InternalError,
+    PolicyViolation,
+    TransientExhaustedError,
+)
 from .gmail_client import GmailClient, guard_self_test
 from .labels import LabelResolver
 from .models import AuditAction, Band, PlannedAction, RunSummary, State
@@ -35,10 +50,14 @@ _CAP = {
     AuditAction.LABEL_CHANGE: CAPABILITY_OF[ActionType.LABEL_ADD],
     AuditAction.DRAFT_CREATE: CAPABILITY_OF[ActionType.DRAFT_CREATE],
 }
+# Errors that concern exactly one message; everything else is global and stops the run.
+MESSAGE_SCOPED_CODES = frozenset({"API_CLIENT", "API_NOT_FOUND", "API_CONFLICT"})
+QUARANTINE_AFTER = 3
+_UNKNOWN_OUTCOME = (TransientExhaustedError, AmbiguousWriteError)
 
 
 def new_run_id() -> str:
-    return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
+    return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(8)
 
 
 def action_key(a: PlannedAction) -> str:
@@ -102,9 +121,11 @@ class Engine:
         *,
         out: Out = print,
         run_id: str | None = None,
+        retry_quarantined: bool = False,
     ) -> None:
         self.client, self.cfg, self.ctx, self.ledger = client, cfg, ctx, ledger
         self.out = out
+        self.retry_quarantined = retry_quarantined
         self.run_id = run_id or new_run_id()
         self.resolver = LabelResolver(client, cfg)
         self.summary = RunSummary(run_id=self.run_id, mode=ctx.mode, profile=ctx.profile.value)
@@ -126,16 +147,16 @@ class Engine:
     # ------------------------------------------------------------------ public
     def run(self) -> RunSummary:
         s = self.summary
-        self._audit(
-            "RUN_START",
-            detail={
-                "version": __version__,
-                "query_fp": fingerprint(self.cfg.gmail_query),
-                "max": self.cfg.max_messages_per_run,
-                "capabilities": sorted(self.ctx.capabilities),
-            },
-        )
         try:
+            self._audit(
+                "RUN_START",
+                detail={
+                    "version": __version__,
+                    "query_fp": fingerprint(self.cfg.gmail_query),
+                    "max": self.cfg.max_messages_per_run,
+                    "capabilities": sorted(self.ctx.capabilities),
+                },
+            )
             self.resolver.refresh()
             if not self.ctx.dry_run:
                 s.reconciled = reconcile_pending(self.client, self.ledger, self.resolver, self.run_id, self.ctx)
@@ -165,6 +186,8 @@ class Engine:
                     f"  [{cls.state.value:<9} {cls.confidence:4.2f}] {truncate_subject(work.message.subject)}"
                     f"  ({redact(cls.rule_id, max_len=40)})"
                 )
+                if cls.band is not Band.REVIEW_ONLY and self._human_override(work):
+                    continue
                 plans.extend(
                     plan_thread(
                         work,
@@ -203,14 +226,44 @@ class Engine:
                     self.out(f"  plan: {a.describe()}" + ("" if enabled else "  [capability aus]"))
                 else:
                     self._execute(a)
-            s.status = "OK"
+            s.status = "PARTIAL" if (s.message_failures or s.drift) else "OK"
         except FailClosed as exc:
             s.status, self.error = "FAILED_CLOSED", exc
         except GmailAutomationError as exc:
             s.status, self.error = f"ERROR:{exc.code}", exc
+        except KeyboardInterrupt:
+            s.status = "ABORTED"
+            self.error = FailClosed("Run aborted by the user (Ctrl+C)", code="ABORTED")
+            raise  # `finally` still writes RUN_END with status ABORTED
+        except Exception as exc:  # noqa: BLE001 - unexpected types are converted, never leaked as tracebacks
+            name = type(exc).__name__
+            log.error("internal error %s - run stopped fail-closed", name)
+            s.status = "FAILED_CLOSED"
+            self.error = InternalError(f"Internal error ({name}) - run stopped fail-closed", code=f"INTERNAL_{name}")
         finally:
             self._finish()
         return s
+
+    def _human_override(self, work: ThreadWork) -> bool:
+        """The human's decision wins: app labels changed since this program last set them."""
+        last = self.ledger.last_set_labels(work.message.id)
+        if last is None:
+            return False
+        current = self.resolver.app_label_names(work.message.label_ids)
+        if current == last:
+            return False
+        self.summary.human_override += 1
+        self._audit(
+            "SKIPPED_HUMAN_OVERRIDE",
+            thread_id=work.snapshot.thread_id,
+            message_id=work.message.id,
+            content_fingerprint=work.message.fingerprint,
+            before_state={"labels": list(last)},
+            after_state={"labels": list(current)},
+            outcome="HUMAN_DECISION_WINS",
+        )
+        self.out("  manuell geaendert - die Entscheidung des Menschen bleibt bestehen (keine Aktion)")
+        return True
 
     # ------------------------------------------------------------------ finish + gates
     def _finish(self) -> None:
@@ -245,7 +298,11 @@ class Engine:
                 s.status = f"ERROR:{exc.code}"
 
     # ------------------------------------------------------------------ execution
-    def _fail(self, a: PlannedAction, action_id: str, key: str, code: str, after: Any = None) -> FailClosed:
+    def _app_labels_now(self, message_id: str) -> tuple[str, ...]:
+        return self.resolver.app_label_names(self.client.get_message(message_id, "minimal").get("labelIds"))
+
+    def _failed(self, a: PlannedAction, action_id: str, key: str, code: str, after: Any = None) -> None:
+        """Audit FAILED. Message-scoped errors let the run continue; everything else stops it."""
         self.summary.failed += 1
         self._audit(
             "FAILED",
@@ -256,7 +313,11 @@ class Engine:
             error_code=code,
             after_state=after,
         )
-        return FailClosed(f"Mutation failed ({code}) - run stopped (fail closed)", code=code)
+        if code in MESSAGE_SCOPED_CODES and a.kind is not AuditAction.LABEL_CREATE:
+            self.summary.message_failures += 1
+            self.out(f"  FEHLER bei einer Nachricht ({code}) - uebersprungen, der Lauf geht weiter")
+            return
+        raise FailClosed(f"Mutation failed ({code}) - run stopped (fail closed)", code=code)
 
     def _execute(self, a: PlannedAction) -> None:
         s = self.summary
@@ -264,12 +325,21 @@ class Engine:
             self._audit("SKIPPED_CAPABILITY", a, outcome="SKIPPED")
             return
         key = action_key(a)
+        if a.kind is AuditAction.LABEL_CREATE:
+            # The mailbox is the source of truth for labels: a label the user deleted is created again.
+            self._create_label(a, key)
+            return
         if self.ledger.is_key_applied(key):
             s.skipped_idempotent += 1
             self._audit("SKIPPED_IDEMPOTENT", a, idempotency_key=key, outcome="SKIPPED")
             return
-        if a.kind is AuditAction.LABEL_CREATE:
-            self._create_label(a, key)
+        if (
+            not self.retry_quarantined
+            and self.ledger.failure_streak(a.message_id, MESSAGE_SCOPED_CODES) >= QUARANTINE_AFTER
+        ):
+            s.quarantined += 1
+            self._audit("SKIPPED_QUARANTINED", a, idempotency_key=key, outcome="QUARANTINED")
+            self.out(f"  QUARANTAENE: Nachricht scheiterte {QUARANTINE_AFTER}x - uebersprungen ({a.describe()})")
             return
         if not self._fresh(a):
             return
@@ -335,7 +405,8 @@ class Engine:
                         after_state={"label": a.label_name, "label_id": ref2.id},
                     )
                     return
-            raise self._fail(a, action_id, key, exc.code) from None
+            self._failed(a, action_id, key, exc.code)
+            return
         self._audit(
             "APPLIED",
             a,
@@ -346,13 +417,38 @@ class Engine:
         )
         self.out(f"  angewendet: {a.describe()}")
 
+    def _settle_observed(self, a: PlannedAction, action_id: str, key: str, current: tuple[str, ...], code: str) -> None:
+        """Record what Gmail really shows after a write with unknown outcome."""
+        if current == a.expected_after_labels:
+            event, outcome = "RECONCILED_APPLIED", "APPLIED"
+        elif current == a.before_labels:
+            event, outcome = "RECONCILED_NOT_APPLIED", "NOT_APPLIED"
+        else:
+            event, outcome = "RECONCILED_DRIFT", "DRIFT"
+        self._audit(
+            event,
+            a,
+            action_id=action_id,
+            idempotency_key=key,
+            outcome=outcome,
+            error_code=code,
+            before_state={"labels": list(a.before_labels)},
+            after_state={"labels": list(current)},
+        )
+
+    def _outcome_unknown(self, a: PlannedAction, action_id: str, key: str, code: str) -> FailClosed:
+        """Leave the PREPARE pending (non-terminal); the next APPLY run reconciles it."""
+        self._audit("OUTCOME_UNKNOWN", a, action_id=action_id, idempotency_key=key, outcome="PENDING", error_code=code)
+        return FailClosed(f"Outcome unknown ({code}) - left pending for reconciliation", code=code)
+
     def _change_labels(self, a: PlannedAction, key: str) -> None:
         expected = a.expected_after_labels
         try:
             add_refs = [self.resolver.require(n) for n in a.add]
             remove_refs = [self.resolver.require(n) for n in a.remove]
         except GmailAutomationError as exc:
-            raise self._fail(a, "", key, exc.code) from None
+            self._failed(a, "", key, exc.code)
+            return
         action_id = secrets.token_hex(8)
         self._audit(
             "PREPARE",
@@ -364,27 +460,60 @@ class Engine:
             detail={"add": list(a.add), "remove": list(a.remove)},
         )
         try:
-            self.client.modify_message_labels(
+            resp = self.client.modify_message_labels(
                 a.message_id, add=add_refs, remove=remove_refs, confidence=a.confidence, origin=a.origin
             )
-        except GmailAutomationError as exc:
-            raise self._fail(a, action_id, key, exc.code) from None
+        except _UNKNOWN_OUTCOME as exc:
+            # The request may have reached Gmail (5xx / network): look, record the truth, then stop.
+            try:
+                current = self._app_labels_now(a.message_id)
+            except GmailAutomationError:
+                raise self._outcome_unknown(a, action_id, key, exc.code) from None
+            self._settle_observed(a, action_id, key, current, exc.code)
+            raise FailClosed(
+                f"Gmail unstable ({exc.code}) - run stopped after settling the change", code=exc.code
+            ) from None
+        except GmailAutomationError as exc:  # rejected before or by Gmail: definitely not applied
+            self._failed(a, action_id, key, exc.code)
+            return
+        verify_error: GmailAutomationError | None = None
         try:
-            after = self.resolver.app_label_names(self.client.get_message(a.message_id, "minimal").get("labelIds"))
-        except GmailApiError as exc:
-            raise self._fail(a, action_id, key, "VERIFY_" + exc.code) from None
-        if after != expected:
-            raise self._fail(a, action_id, key, "VERIFY_MISMATCH", after={"labels": list(after)})
-        self._audit(
-            "APPLIED",
-            a,
-            action_id=action_id,
-            idempotency_key=key,
-            outcome="APPLIED",
-            before_state={"labels": list(a.before_labels)},
-            after_state={"labels": list(after)},
-        )
-        self.out(f"  angewendet: {a.describe()}")
+            after = self._app_labels_now(a.message_id)
+            source = "read"
+        except GmailAutomationError as exc:
+            resp_labels = resp.get("labelIds") if isinstance(resp, dict) else None
+            if not isinstance(resp_labels, list):
+                raise self._outcome_unknown(a, action_id, key, "VERIFY_" + exc.code) from None
+            after, source, verify_error = self.resolver.app_label_names(resp_labels), "response", exc
+        if after == expected:
+            self._audit(
+                "APPLIED",
+                a,
+                action_id=action_id,
+                idempotency_key=key,
+                outcome="APPLIED",
+                before_state={"labels": list(a.before_labels)},
+                after_state={"labels": list(after)},
+                detail={"verified_by": source},
+            )
+            self.out(f"  angewendet: {a.describe()}")
+        else:
+            # Gmail accepted the write, but the labels differ (filter / second client): applied with drift.
+            self.summary.drift += 1
+            self._audit(
+                "APPLIED_DRIFT",
+                a,
+                action_id=action_id,
+                idempotency_key=key,
+                outcome="VERIFY_MISMATCH",
+                error_code="VERIFY_MISMATCH",
+                before_state={"labels": list(a.before_labels)},
+                after_state={"labels": list(after)},
+                detail={"verified_by": source, "expected": list(expected)},
+            )
+            self.out(f"  ABWEICHUNG: Labels nach dem Schreiben anders als erwartet ({a.describe()})")
+        if verify_error is not None and verify_error.code not in MESSAGE_SCOPED_CODES:
+            raise FailClosed(f"Verification read failed ({verify_error.code}) - run stopped", code=verify_error.code)
 
     def _create_draft(self, a: PlannedAction, key: str) -> None:
         if self.ledger.draft_applied(a.thread_id, a.template_id) or drafts_in_thread(self.client, a.thread_id):
@@ -406,20 +535,26 @@ class Engine:
         try:
             res = self.client.create_draft(a.thread_id, raw, confidence=a.confidence, state=a.state)
         except AmbiguousWriteError as exc:
-            found = find_draft_with_key(self.client, a.thread_id, key)
+            try:
+                found = find_draft_with_key(self.client, a.thread_id, key)
+            except GmailAutomationError:
+                raise self._outcome_unknown(a, action_id, key, exc.code) from None
+            self._audit(
+                "RECONCILED_APPLIED" if found else "RECONCILED_NOT_APPLIED",
+                a,
+                action_id=action_id,
+                idempotency_key=key,
+                outcome="APPLIED" if found else "NOT_APPLIED",
+                error_code=exc.code,
+                after_state={"draft_id": found} if found else None,
+                detail={"template_id": a.template_id},
+            )
             if found:
-                self._audit(
-                    "RECONCILED_APPLIED",
-                    a,
-                    action_id=action_id,
-                    idempotency_key=key,
-                    after_state={"draft_id": found},
-                    detail={"template_id": a.template_id},
-                )
                 return
-            raise self._fail(a, action_id, key, exc.code) from None
+            raise FailClosed(f"Draft creation failed ({exc.code}) - run stopped", code=exc.code) from None
         except GmailAutomationError as exc:
-            raise self._fail(a, action_id, key, exc.code) from None
+            self._failed(a, action_id, key, exc.code)
+            return
         self._audit(
             "APPLIED",
             a,
@@ -464,7 +599,9 @@ def reconcile_pending(
         if kind == AuditAction.LABEL_CHANGE.value:
             try:
                 cur = resolver.app_label_names(client.get_message(p["message_id"], "minimal").get("labelIds"))
-            except GmailApiError:
+            except GmailApiError as exc:
+                if exc.code != "API_NOT_FOUND":
+                    raise  # transient/auth: the row stays pending, the run fails closed
                 note("RECONCILED_DRIFT", p, outcome="MESSAGE_UNAVAILABLE")
                 continue
             if cur == _labels_of(p["after_state"]):
@@ -488,7 +625,9 @@ def reconcile_pending(
         count += 1
         try:
             cur = resolver.app_label_names(client.get_message(p["message_id"], "minimal").get("labelIds"))
-        except GmailApiError:
+        except GmailApiError as exc:
+            if exc.code != "API_NOT_FOUND":
+                raise
             note("UNDO_RECONCILED_DRIFT", p, outcome="MESSAGE_UNAVAILABLE")
             continue
         if cur == _labels_of(p["after_state"]):

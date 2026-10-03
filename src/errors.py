@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+EXIT_PARTIAL = 9  # some message-scoped actions failed / undo could only partly be completed
+EXIT_INTERNAL = 10  # unexpected internal error - stopped fail-closed
+
 
 class GmailAutomationError(Exception):
     """Base class. `code` is a stable machine-readable error code."""
@@ -69,6 +72,16 @@ class FailClosed(GmailAutomationError):
     """Raised to stop a run after a mutation failed. Already-applied work stays audited."""
 
     exit_code = 8
+
+
+class InternalError(FailClosed):
+    """An unexpected exception type was converted into a fail-closed stop (no traceback, type only)."""
+
+    exit_code = EXIT_INTERNAL
+
+
+class RunBudgetExceeded(FailClosed):
+    """The run exceeded its wall-clock deadline or its cumulative backoff budget."""
 
 
 class MimeError(GmailAutomationError):

@@ -44,10 +44,17 @@ def _newest(messages: list[dict[str, Any]]) -> dict[str, Any]:
     return max(messages, key=key)
 
 
+def _is_draft(m: dict[str, Any]) -> bool:
+    labels = m.get("labelIds") or []
+    return isinstance(labels, list) and "DRAFT" in labels
+
+
 def snapshot_from_thread(thread: dict[str, Any], max_messages: int) -> ThreadSnapshot:
-    msgs = [m for m in (thread.get("messages") or []) if isinstance(m, dict) and m.get("id")]
+    """Newest REAL message of a thread. Draft messages (including this program's own reply
+    drafts) are ignored, so a draft is never classified as if it were incoming mail."""
+    msgs = [m for m in (thread.get("messages") or []) if isinstance(m, dict) and m.get("id") and not _is_draft(m)]
     if not msgs:
-        raise GmailApiError("Thread without messages", code="EMPTY_THREAD")
+        raise GmailApiError("Thread without (non-draft) messages", code="EMPTY_THREAD")
     truncated = len(msgs) > max_messages
     newest = _newest(msgs)
     return ThreadSnapshot(

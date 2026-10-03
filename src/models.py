@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any
 
@@ -125,6 +125,10 @@ class RunSummary:
     stale: int = 0
     duplicate_drafts: int = 0
     failed: int = 0
+    message_failures: int = 0
+    quarantined: int = 0
+    human_override: int = 0
+    drift: int = 0
     read_errors: int = 0
     reconciled: int = 0
     status: str = "RUNNING"
@@ -145,4 +149,4 @@ class RunSummary:
         ]
 
     def to_dict(self) -> dict[str, Any]:
-        return dict(self.__dict__)
+        return asdict(self)
