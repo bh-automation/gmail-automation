@@ -1007,3 +1007,11 @@ def test_B_M3_concurrent_reader_never_raises_a_false_anchor_alarm(tmp_path):
     assert w.wait(timeout=120) == 0
     stats = json.loads(r.stdout.strip().splitlines()[-1])
     assert stats["opens"] > 5 and stats["alarms"] == [], stats
+
+
+def test_transport_self_test_is_part_of_every_gate_summary(cfg, ledger):
+    from src.gmail_client import transport_self_test
+
+    assert all(transport_self_test().values())
+    s, _ = run_engine(mailbox(), cfg, ledger, apply=False)
+    assert s.send_block == "PASS" and s.delete_block == "PASS"

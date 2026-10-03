@@ -9,7 +9,7 @@ Release-Regel: Alle Gates müssen PASS sein. Ein Critical- oder High-Finding aus
 | Gate | Prüfung | Nachweis | Status |
 |---|---|---|---|
 | G1 Lint | ruff check, ruff format --check, mypy | `scripts/verify.ps1`, CI-Schritte „G1“ | PASS |
-| G2 Tests | komplette Suite, offline | `python -m pytest` – 355/355 (3.12 und 3.13) | PASS |
+| G2 Tests | komplette Suite, offline | `python -m pytest` – 356/356 (3.12 und 3.13) | PASS |
 | G3 Secret-Scan | Dateinamen, Inhalte, von Git verfolgte Dateien, Git-Historie | `tools/secret_scan.py`, `test_secret_scan_*`, `test_gitignore_covers_secrets_and_state` | PASS |
 | G4 OBSERVE kann nichts ändern | Policy (Profil), Adapter-Allow-List, Transport-Allow-List (OBSERVE erlaubt nur GET) | `test_observe_*`, `test_observe_client_cannot_mutate_and_never_reaches_fake`, `test_transport_allow_list` | PASS |
 | G5 Senden gesperrt | Policy-Invariante, Adapter-Guard, Transport-Guard, statischer Gate-Scan, Laufzeit-Selbsttest in jeder Zusammenfassung | `test_send_hard_block`, `test_monkeypatched_send_method_still_blocked`, `test_real_googleapiclient_service_cannot_send_even_without_the_adapter`, `test_draft_is_never_sent`, `SEND_BLOCK = PASS` | PASS |

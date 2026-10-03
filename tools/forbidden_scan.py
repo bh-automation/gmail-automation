@@ -56,7 +56,7 @@ RAW_URL_RE = re.compile(r"mail\.google\.com|gmail\.googleapis\.com|googleapis\.c
 # All exemptions are bound to exact repository paths (a planted "auth.py" elsewhere gets none).
 ADAPTER = "src/gmail_client.py"
 SELF = "tools/forbidden_scan.py"
-EXEMPT_FUNCS = {(ADAPTER, "guard_self_test")}
+EXEMPT_FUNCS = {(ADAPTER, "guard_self_test"), (ADAPTER, "transport_self_test")}  # prove blocks, never call out
 EXEMPT_ASSIGNMENTS = {
     ("src/auth.py", "FORBIDDEN_SCOPES"),
     (ADAPTER, "GMAIL_HOSTS"),

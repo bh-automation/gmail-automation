@@ -307,6 +307,27 @@ def guard_self_test() -> dict[str, bool]:
     return out
 
 
+def transport_self_test() -> dict[str, bool]:
+    """Proves at runtime that the HTTP transport refuses send / delete / trash / system labels."""
+    base = "https://gmail.googleapis.com/gmail/v1/users/me"
+    probes = {
+        "messages.send": ("POST", base + "/messages/send", None),
+        "drafts.send": ("POST", base + "/drafts/send", None),
+        "messages.delete": ("DELETE", base + "/messages/m1", None),
+        "messages.trash": ("POST", base + "/messages/m1/trash", None),
+        "modify.TRASH": ("POST", base + "/messages/m1/modify", '{"addLabelIds": ["TRASH"]}'),
+    }
+    out: dict[str, bool] = {}
+    for key, (method, uri, body) in probes.items():
+        try:
+            endpoint = check_transport(method, uri, APPLY_ENDPOINTS)
+            check_transport_body(endpoint, body)
+            out[key] = False
+        except PolicyViolation:
+            out[key] = True
+    return out
+
+
 @dataclass(frozen=True)
 class LabelRef:
     id: str

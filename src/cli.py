@@ -311,16 +311,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         return f"{len(c.rules)} rules, capabilities={sorted(c.capabilities) or 'none'}"
 
     def blocks() -> str:
-        p, g = self_test(), guard_self_test()
-        if not (all(p.values()) and all(g.values())):
-            raise GmailAutomationError(f"self-test failed {p} {g}", code="BLOCK_SELFTEST")
-        return "send/draft-send/delete/trash blocked (policy + adapter)"
+        from .gmail_client import transport_self_test
+
+        p, g, t = self_test(), guard_self_test(), transport_self_test()
+        if not (all(p.values()) and all(g.values()) and all(t.values())):
+            raise GmailAutomationError(f"self-test failed {p} {g} {t}", code="BLOCK_SELFTEST")
+        return "send/draft-send/delete/trash blocked (policy + adapter + transport)"
 
     def secrets_loc() -> str:
         notes = []
         cs = paths.client_secret_path()
         check_secret_location(cs)
-        notes.append("client_secret " + ("ok" if cs.exists() else "fehlt (Schritt 1 der Anleitung)"))
+        notes.append("client_secret " + ("ok" if cs.exists() else "fehlt (README, Schnellstart Schritt 2)"))
         for prof in Profile:
             tp = paths.token_path(prof.value)
             check_secret_location(tp)

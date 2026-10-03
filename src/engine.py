@@ -35,7 +35,7 @@ from .errors import (
     PolicyViolation,
     TransientExhaustedError,
 )
-from .gmail_client import GmailClient, guard_self_test
+from .gmail_client import GmailClient, guard_self_test, transport_self_test
 from .labels import LabelResolver
 from .models import AuditAction, Band, PlannedAction, RunSummary, State
 from .policy import CAPABILITY_OF, ActionType, PolicyContext, self_test
@@ -268,10 +268,18 @@ class Engine:
     def _finish(self) -> None:
         s = self.summary
         s.mutations = self.client.mutation_count
-        p, g = self_test(), guard_self_test()
+        p, g, t = self_test(), guard_self_test(), transport_self_test()
         s.send_block = (
             "PASS"
-            if (p["send"] and p["draft_send"] and p["constants"] and g["messages.send"] and g["drafts.send"])
+            if (
+                p["send"]
+                and p["draft_send"]
+                and p["constants"]
+                and g["messages.send"]
+                and g["drafts.send"]
+                and t["messages.send"]
+                and t["drafts.send"]
+            )
             else "FAIL"
         )
         s.delete_block = (
@@ -283,6 +291,9 @@ class Engine:
                 and g["threads.delete"]
                 and g["messages.batchDelete"]
                 and g["messages.trash"]
+                and t["messages.delete"]
+                and t["messages.trash"]
+                and t["modify.TRASH"]
             )
             else "FAIL"
         )
