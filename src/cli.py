@@ -1,4 +1,4 @@
-"""Command line: doctor | auth | scan | run | status | undo | config-check | audit-verify.
+"""Command line: doctor | auth | scan | run | status | undo | config-check | audit-verify | audit-rebaseline.
 
 Default is always DRY-RUN. Mailbox changes need the explicit flag --apply, the APPLY
 OAuth profile and an enabled capability in the config. No environment variable or
@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import logging
 import logging.handlers
 import subprocess
 import sys
 from collections.abc import Callable
+from importlib import metadata
 from pathlib import Path
 from typing import Any
 
@@ -24,17 +26,26 @@ from .auth import (
     build_gmail_service,
     check_secret_location,
     load_credentials,
+    make_refresher,
     run_consent_flow,
 )
 from .config import Config, load_config
-from .engine import Engine
-from .errors import ConflictError, GmailAutomationError
+from .engine import MESSAGE_SCOPED_CODES, QUARANTINE_AFTER, Engine, new_run_id
+from .errors import (
+    EXIT_INTERNAL,
+    EXIT_PARTIAL,
+    AuditUnavailableError,
+    ConflictError,
+    FailClosed,
+    GmailAutomationError,
+)
 from .gmail_client import GmailClient
 from .lock import SingleInstanceLock
 from .policy import PolicyContext, Profile
 from .redaction import RedactingFilter, redact
 
 EXIT_OK = 0
+RUN_DEADLINE_SECONDS = 30 * 60  # one run never holds the instance lock longer than this
 
 
 def _out(line: str) -> None:
@@ -83,18 +94,21 @@ ServiceFactory = Callable[[Profile], tuple[Any, Callable[[], None] | None]]
 
 def default_service_factory(profile: Profile) -> tuple[Any, Callable[[], None] | None]:
     creds, _ = load_credentials(profile, paths.token_path(profile.value))
-
-    def refresh() -> None:
-        from google.auth.transport.requests import Request
-
-        creds.refresh(Request())
-
-    return build_gmail_service(creds), refresh
+    return build_gmail_service(creds, profile), make_refresher(creds)
 
 
-def _open_ledger() -> AuditLedger:
-    paths.ensure_private_dir(paths.data_dir())
-    return AuditLedger(paths.audit_db_path())
+def _new_client(service: Any, ctx: PolicyContext, refresh: Callable[[], None] | None) -> GmailClient:
+    return GmailClient(service, ctx, refresh_credentials=refresh, deadline_seconds=RUN_DEADLINE_SECONDS)
+
+
+def _open_ledger(*, check_anchor: bool = True) -> AuditLedger:
+    try:
+        paths.ensure_private_dir(paths.data_dir())
+    except OSError as exc:
+        raise AuditUnavailableError(
+            f"Data folder not writable ({exc.__class__.__name__}): {paths.data_dir()}", code="DATA_DIR_UNWRITABLE"
+        ) from None
+    return AuditLedger(paths.audit_db_path(), check_anchor=check_anchor)
 
 
 def cmd_config_check(args: argparse.Namespace) -> int:
@@ -119,16 +133,32 @@ def cmd_scan_or_run(args: argparse.Namespace, factory: ServiceFactory) -> int:
         _out(f"APPLY aktiv | Capabilities: {caps} | Senden/Loeschen technisch gesperrt")
     with SingleInstanceLock(paths.lock_path()), _open_ledger() as ledger:
         service, refresh = factory(profile)
-        client = GmailClient(service, ctx, refresh_credentials=refresh)
-        engine = Engine(client, cfg, ctx, ledger, out=_out)
+        client = _new_client(service, ctx, refresh)
+        engine = Engine(
+            client, cfg, ctx, ledger, out=_out, retry_quarantined=bool(getattr(args, "retry_quarantined", False))
+        )
         summary = engine.run()
     _out("")
     for line in summary.gate_lines():
         _out(line)
+    extras = []
+    for label, value in (
+        ("FEHLGESCHLAGEN", summary.message_failures),
+        ("QUARANTAENE", summary.quarantined),
+        ("MANUELL_GEAENDERT", summary.human_override),
+        ("ABWEICHUNG", summary.drift),
+    ):
+        if value:
+            extras.append(f"{label} = {value}")
+    if extras:
+        _out(" | ".join(extras))
     _out(f"RUN_ID = {summary.run_id} | STATUS = {summary.status}")
     if engine.error is not None:
         _out(f"FEHLER: {engine.error}")
         return engine.error.exit_code
+    if summary.status == "PARTIAL":
+        _out("Teilweise erfolgreich - Details: python -m src.cli status")
+        return EXIT_PARTIAL
     return EXIT_OK
 
 
@@ -138,6 +168,13 @@ def cmd_status(args: argparse.Namespace) -> int:
         _out(f"AUDIT = {'PASS' if ok else 'FAIL'} ({msg})")
         pend = ledger.pending()
         _out(f"OFFENE AKTIONEN = {len(pend)}" + (" (naechster APPLY-Lauf gleicht ab)" if pend else ""))
+        quarantined = ledger.quarantined(MESSAGE_SCOPED_CODES, QUARANTINE_AFTER)
+        _out(
+            f"QUARANTAENE = {len(quarantined)}"
+            + (" (erneut versuchen: run --apply --retry-quarantined)" if quarantined else "")
+        )
+        for mid in quarantined[:20]:
+            _out(f"  Nachricht {mid[:10]}...")
         for r in ledger.runs(limit=args.runs):
             end = r.get("end") or {}
             _out(f"  {r['run_id']}  {r['mode']:<7} {r['profile']:<7} {r['ts'][:19]}Z  {end.get('outcome') or 'OFFEN'}")
@@ -156,11 +193,12 @@ def cmd_undo(args: argparse.Namespace, factory: ServiceFactory) -> int:
         profile = Profile.APPLY if args.apply else Profile.OBSERVE
         ctx = build_context(cfg, profile, bool(args.apply))
         service, refresh = factory(profile)
-        client = GmailClient(service, ctx, refresh_credentials=refresh)
+        client = _new_client(service, ctx, refresh)
         res = undo_run(client, cfg, ctx, ledger, run_id, apply=bool(args.apply), out=_out)
     _out(f"UNDO = {res.status} | Ziel-Lauf {res.run_id} | Undo-Lauf {res.undo_run_id}")
     for c in res.conflicts:
-        _out(f"  CONFLICT {c['message_id'][:8]}... {c['reason']} - Postfach unveraendert")
+        hint = " (erst den spaeteren Lauf rueckgaengig machen)" if c["reason"] == "LATER_RUN" else ""
+        _out(f"  CONFLICT {c['message_id'][:8]}... {c['reason']} - Postfach unveraendert{hint}")
     for p in res.planned:
         _out(
             f"  {'zurueckgesetzt' if res.status == 'DONE' else 'wuerde zuruecksetzen'}: {p['message_id'][:8]}... "
@@ -172,6 +210,16 @@ def cmd_undo(args: argparse.Namespace, factory: ServiceFactory) -> int:
         _out("Vorschau. Ausfuehren mit: python -m src.cli undo --run-id " + res.run_id + " --apply")
     if res.status == "CONFLICT":
         raise ConflictError("Undo refused: mailbox changed since the run", code="UNDO_CONFLICT")
+    if res.status == "ROLLED_BACK":
+        _out(f"Undo fehlgeschlagen ({res.error_code}) und vollstaendig zurueckgerollt - Postfach wie vor dem Undo.")
+        return FailClosed.exit_code
+    if res.status == "PARTIAL":
+        _out(f"UNDO TEILWEISE ({res.error_code}) - bitte diese Nachrichten pruefen:")
+        for mid in res.still_reverted:
+            _out(f"  zurueckgesetzt geblieben: {mid[:10]}...")
+        for mid in res.unknown:
+            _out(f"  Zustand unbekannt (naechster APPLY-Lauf gleicht ab): {mid[:10]}...")
+        return EXIT_PARTIAL
     return EXIT_OK
 
 
@@ -195,6 +243,24 @@ def cmd_audit_verify(args: argparse.Namespace) -> int:
     return EXIT_OK if ok else 5
 
 
+def cmd_audit_rebaseline(args: argparse.Namespace) -> int:
+    """Explicit, audited repair of the rollback anchor (never automatic)."""
+    with SingleInstanceLock(paths.lock_path()), _open_ledger(check_anchor=False) as ledger:
+        ok, msg = ledger.verify_chain()
+        seq, _ = ledger.head()
+        _out(f"HASH-KETTE = {'PASS' if ok else 'FAIL'} ({msg}) | Eintraege: {seq}")
+        if not ok:
+            _out("Neu-Verankerung abgelehnt: die Kette selbst ist beschaedigt.")
+            return 5
+        if not args.confirm:
+            _out("Vorschau. Nur ausfuehren, wenn KEIN altes Backup zurueckgespielt wurde:")
+            _out("  python -m src.cli audit-rebaseline --confirm")
+            return 2
+        ledger.rebaseline(run_id=new_run_id(), reason="cli")
+    _out("AUDIT-ANKER = NEU GESETZT (Ereignis HEAD_REBASELINE protokolliert)")
+    return EXIT_OK
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     from .gmail_client import guard_self_test
     from .policy import self_test
@@ -215,12 +281,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         return sys.version.split()[0]
 
     def deps() -> str:
-        import google.auth  # noqa: F401
-        import google_auth_oauthlib  # noqa: F401
-        import googleapiclient  # noqa: F401
-        import yaml  # noqa: F401
-
-        return "google-api-python-client, google-auth, oauthlib, PyYAML"
+        names = ("google-api-python-client", "google-auth", "google-auth-oauthlib", "google-auth-httplib2", "PyYAML")
+        found = [f"{n} {metadata.version(n)}" for n in names]
+        marker = paths.PROJECT_ROOT / ".venv" / ".bootstrap-ok"
+        if marker.exists():
+            want = hashlib.sha256((paths.PROJECT_ROOT / "requirements-lock.txt").read_bytes()).hexdigest()
+            if want not in marker.read_text(encoding="utf-8", errors="replace"):
+                raise GmailAutomationError(
+                    "requirements-lock.txt changed since setup - run scripts/bootstrap.ps1 again", code="DEPS_STALE"
+                )
+        return ", ".join(found)
 
     def cfg() -> str:
         c = load_config(Path(args.config))
@@ -266,7 +336,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         )
         if r.returncode != 0:
             raise GmailAutomationError(r.stdout.strip()[-300:], code="FORBIDDEN_SCAN")
-        return "no forbidden Gmail calls in src/"
+        return "no forbidden Gmail calls / transports / reflection in src/ and tools/"
 
     def audit() -> str:
         if not paths.audit_db_path().exists():
@@ -306,7 +376,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="python -m src.cli", description="GMAIL-AUTOMATION (Standard: DRY-RUN)")
+    # allow_abbrev=False: "--app" / "--a" must never be accepted as "--apply"
+    p = argparse.ArgumentParser(
+        prog="python -m src.cli", description="GMAIL-AUTOMATION (Standard: DRY-RUN)", allow_abbrev=False
+    )
     p.add_argument("--version", action="version", version=__version__)
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="command", required=True)
@@ -314,29 +387,36 @@ def build_parser() -> argparse.ArgumentParser:
     def with_config(sp: argparse.ArgumentParser) -> None:
         sp.add_argument("--config", default=str(paths.default_config_path()))
 
-    d = sub.add_parser("doctor", help="Umgebung, Konfiguration, Sperren und Audit pruefen")
+    d = sub.add_parser("doctor", help="Umgebung, Konfiguration, Sperren und Audit pruefen", allow_abbrev=False)
     with_config(d)
     d.add_argument("--online", action="store_true", help="Token-Scopes live bei Google pruefen")
-    a = sub.add_parser("auth", help="Google-Anmeldung fuer ein Profil (Browser)")
+    a = sub.add_parser("auth", help="Google-Anmeldung fuer ein Profil (Browser)", allow_abbrev=False)
     a.add_argument("--profile", choices=[x.value for x in Profile], default="observe")
-    s = sub.add_parser("scan", help="Nur lesen + klassifizieren (immer DRY-RUN)")
+    s = sub.add_parser("scan", help="Nur lesen + klassifizieren (immer DRY-RUN)", allow_abbrev=False)
     with_config(s)
     s.add_argument("--max", type=int)
-    r = sub.add_parser("run", help="Lauf; ohne --apply DRY-RUN")
+    r = sub.add_parser("run", help="Lauf; ohne --apply DRY-RUN", allow_abbrev=False)
     with_config(r)
     r.add_argument("--max", type=int)
     r.add_argument("--apply", action="store_true", help="Postfach-Aenderungen ausdruecklich erlauben")
-    st = sub.add_parser("status", help="Letzte Laeufe + Audit-Integritaet")
+    r.add_argument(
+        "--retry-quarantined", action="store_true", help="Nachrichten in Quarantaene in diesem Lauf erneut versuchen"
+    )
+    st = sub.add_parser("status", help="Letzte Laeufe + Audit-Integritaet", allow_abbrev=False)
     st.add_argument("--runs", type=int, default=10)
-    u = sub.add_parser("undo", help="Lauf rueckgaengig machen (ohne --apply nur Vorschau)")
+    u = sub.add_parser("undo", help="Lauf rueckgaengig machen (ohne --apply nur Vorschau)", allow_abbrev=False)
     with_config(u)
     g = u.add_mutually_exclusive_group(required=True)
     g.add_argument("--last-run", action="store_true")
     g.add_argument("--run-id")
     u.add_argument("--apply", action="store_true")
-    cc = sub.add_parser("config-check", help="Konfiguration validieren")
+    cc = sub.add_parser("config-check", help="Konfiguration validieren", allow_abbrev=False)
     with_config(cc)
-    sub.add_parser("audit-verify", help="Hash-Kette des Audit-Ledgers pruefen")
+    sub.add_parser("audit-verify", help="Hash-Kette des Audit-Ledgers pruefen", allow_abbrev=False)
+    rb = sub.add_parser(
+        "audit-rebaseline", help="Audit-Anker nach Pruefung neu setzen (nur mit --confirm)", allow_abbrev=False
+    )
+    rb.add_argument("--confirm", action="store_true")
     return p
 
 
@@ -366,12 +446,18 @@ def main(argv: list[str] | None = None, *, service_factory: ServiceFactory | Non
             return cmd_config_check(args)
         if args.command == "audit-verify":
             return cmd_audit_verify(args)
+        if args.command == "audit-rebaseline":
+            return cmd_audit_rebaseline(args)
     except GmailAutomationError as exc:
         _out(f"ABBRUCH ({exc.code}): {exc}")
         return exc.exit_code
     except KeyboardInterrupt:
         _out("ABBRUCH durch Benutzer - offene Aktionen werden beim naechsten APPLY-Lauf abgeglichen.")
         return 130
+    except Exception as exc:  # noqa: BLE001 - last line of defence: no raw traceback, type name only
+        logging.getLogger("gmail_automation").error("internal error %s", type(exc).__name__)
+        _out(f"ABBRUCH (INTERNAL_{type(exc).__name__}): unerwarteter Fehler - nichts wurde unkontrolliert geaendert.")
+        return EXIT_INTERNAL
     return 1  # pragma: no cover
 
 
