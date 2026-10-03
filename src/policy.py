@@ -143,7 +143,10 @@ def authorize(
     if ctx.dry_run:  # pragma: no cover - implied by the two checks above
         raise PolicyViolation("Mutation denied in DRY-RUN", code="DRY_RUN")
     cap = CAPABILITY_OF[act]
-    if cap not in ctx.capabilities:
+    # Undo restores an audited earlier state of application labels. It still needs APPLY
+    # profile + explicit --apply, but not the capability flag: switching capabilities off
+    # (kill switch) must never block the recovery of a bad run.
+    if cap not in ctx.capabilities and origin != "undo":
         raise PolicyViolation(f"Capability '{cap}' is not enabled in config", code="CAPABILITY_GATE")
 
     if act in (ActionType.LABEL_CREATE, ActionType.LABEL_ADD, ActionType.LABEL_REMOVE) and (
