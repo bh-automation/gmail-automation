@@ -85,7 +85,10 @@ def test_secret_symlink_and_permissions_refused(data_dir):
     target = data_dir / "real.json"
     target.write_text("{}", encoding="utf-8")
     link = data_dir / "token_observe.json"
-    link.symlink_to(target)
+    try:
+        link.symlink_to(target)
+    except OSError as exc:  # Windows without the symlink privilege (WinError 1314): nothing to test here
+        pytest.skip(f"symlinks not permitted for this user ({exc.__class__.__name__})")
     with pytest.raises(SecretLocationError) as e:
         check_secret_location(link)
     assert e.value.code == "SECRET_SYMLINK"

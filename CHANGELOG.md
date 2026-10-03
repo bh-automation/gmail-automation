@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.0rc3 – 2026-10-03
+
+Windows-Kompatibilität. Keine Verhaltensänderung an Policy-Kernel, Send-/Delete-Sperre, Gmail-Mutationspfad, OAuth-Modell oder Mission Control.
+
+- Audit: Beim Lesen des Rollback-Ankers wird ein transienter `PermissionError` (Windows-Sharing-Violation während `os.replace` eines Schreibers) kurz und begrenzt wiederholt (max. 6 Versuche, ~1 s). Ein dauerhafter Fehler wird unverändert als Audit-Fehler gemeldet (fail closed).
+- Tests (4 Portabilitätskorrekturen, nur Testcode): Ledger vor `os.replace` schließen (Windows-Dateisperre); UTC-Zeitstempel ohne `time.tzset` prüfen; Symlink-Test wird ohne Symlink-Privileg übersprungen; Anker-Fehlpfad akzeptiert `AUDIT_ANCHOR_UNREADABLE` oder `AUDIT_ANCHOR_MISSING`.
+- Dokumentiert: Auf Windows-Systemen mit Smart App Control / Anwendungssteuerung kann `ruff.exe` blockiert sein (WinError 4551). Das ist `BLOCKED_ENVIRONMENT`, kein Produktfehler; Lint/Format gelten dann über die Linux-CI. Die Richtlinie wird nicht geändert oder umgangen.
+
 ## 1.0.0rc2 – 2026-10-03
 
 Keine funktionalen Code-Änderungen gegenüber rc1.

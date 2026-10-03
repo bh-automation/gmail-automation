@@ -97,7 +97,8 @@ def test_rewritten_history_is_detected_via_head(data_dir):
     for i in range(2):  # same length, different (but internally consistent) history
         other.append(run_id="rX", profile="apply", mode="APPLY", event="FORGED", message_id=f"x{i}")
     other.close()
-    assert AuditLedger(forged, head_path=data_dir / "forged.head.json").verify()[0]
+    with AuditLedger(forged, head_path=data_dir / "forged.head.json") as check:
+        assert check.verify()[0]  # closed before the file is moved (Windows locks open DB files)
     __import__("os").replace(forged, db)
     with pytest.raises(AuditIntegrityError) as e:
         AuditLedger(db)
@@ -155,8 +156,10 @@ def test_newer_schema_is_refused(data_dir):
 
 
 def test_timestamps_are_utc_regardless_of_timezone(data_dir, monkeypatch):
+    from datetime import UTC, datetime
+
     monkeypatch.setenv("TZ", "Pacific/Kiritimati")
-    if hasattr(time, "tzset"):
+    if hasattr(time, "tzset"):  # POSIX only; on Windows the TZ variable has no effect on the CRT clock
         time.tzset()
     led = AuditLedger(data_dir / "tz.sqlite3")
     led.append(run_id="r", profile="p", mode="m", event="E")
@@ -166,7 +169,9 @@ def test_timestamps_are_utc_regardless_of_timezone(data_dir, monkeypatch):
     if hasattr(time, "tzset"):
         time.tzset()
     assert ts.endswith("Z")
-    assert abs(time.time() - time.mktime(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")) + time.timezone) < 120
+    # compare in UTC on both platforms: the stored instant must be "now" regardless of local zone
+    stored = datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=UTC)
+    assert abs((datetime.now(UTC) - stored).total_seconds()) < 120
 
 
 def test_unknown_fields_rejected(ledger):

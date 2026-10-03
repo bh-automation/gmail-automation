@@ -271,9 +271,21 @@ class AuditLedger:
         row = self._db.execute("SELECT seq, row_hash FROM ledger ORDER BY seq DESC LIMIT 1").fetchone()
         return (int(row["seq"]), str(row["row_hash"])) if row else (0, GENESIS)
 
+    def _read_anchor_text(self) -> str:
+        """Windows: a reader can hit a sharing violation (PermissionError) for a few ms while a writer
+        swaps the anchor with os.replace. Retry briefly; a persistent error is reported as before."""
+        for attempt in range(6):
+            try:
+                return self.head_path.read_text(encoding="utf-8")
+            except PermissionError:
+                if attempt == 5 or self.head_path.is_dir():
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+        raise AssertionError("unreachable")  # pragma: no cover
+
     def _read_head_file(self) -> tuple[int, str] | None:
         try:
-            data = json.loads(self.head_path.read_text(encoding="utf-8"))
+            data = json.loads(self._read_anchor_text())
             seq, h = int(data["seq"]), str(data["hash"])
         except FileNotFoundError:
             return None

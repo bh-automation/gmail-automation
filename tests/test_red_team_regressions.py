@@ -960,9 +960,11 @@ def test_C_I1_unreadable_anchor_location_is_not_called_corrupt(data_dir, tmp_pat
         with pytest.raises(AuditUnavailableError) as e:
             led.append(run_id="r", profile="p", mode="m", event="E")
         assert e.value.code == "AUDIT_HEAD_WRITE"
-    with pytest.raises(AuditUnavailableError) as e2:
+    # POSIX reports NotADirectoryError (-> UNREADABLE); Windows reports FileNotFoundError for a path
+    # through a file (-> anchor MISSING with rows present). Both refuse to start: fail closed.
+    with pytest.raises((AuditUnavailableError, AuditIntegrityError)) as e2:
         AuditLedger(db, head_path=blocker / "x.head.json")
-    assert e2.value.code == "AUDIT_ANCHOR_UNREADABLE"
+    assert e2.value.code in {"AUDIT_ANCHOR_UNREADABLE", "AUDIT_ANCHOR_MISSING"}
 
 
 def test_B_M3_concurrent_reader_never_raises_a_false_anchor_alarm(tmp_path):
