@@ -252,12 +252,26 @@ def cmd_audit_rebaseline(args: argparse.Namespace) -> int:
         if not ok:
             _out("Neu-Verankerung abgelehnt: die Kette selbst ist beschaedigt.")
             return 5
-        if not args.confirm:
-            _out("Vorschau. Nur ausfuehren, wenn KEIN altes Backup zurueckgespielt wurde:")
-            _out("  python -m src.cli audit-rebaseline --confirm")
+        verdict, detail = ledger.anchor_verdict()
+        _out(f"ANKER-BEFUND = {verdict} ({detail})")
+        if verdict == "OK":
+            _out("Nichts zu tun - der Anker passt zum Ledger.")
+            return EXIT_OK
+        extra = {"AUDIT_ROLLBACK": "accept_rollback", "AUDIT_HEAD_MISMATCH": "accept_rewrite"}.get(verdict)
+        if verdict == "AUDIT_ROLLBACK":
+            _out("WARNUNG: Das Ledger ist AELTER als der Anker (Backup zurueckgespielt?). Neu-Verankern")
+            _out("verwirft die Historie seit dem Backup: Idempotenz und Undo fuer diese Laeufe gehen verloren.")
+        if verdict == "AUDIT_HEAD_MISMATCH":
+            _out("WARNUNG: Die Ledger-Historie wurde UMGESCHRIEBEN. Nur fortfahren, wenn Sie das selbst waren.")
+        accepted = {"accept_rollback": args.accept_rollback, "accept_rewrite": args.accept_rewrite}
+        missing_flag = bool(extra) and not accepted.get(extra or "", False)
+        if not args.confirm or missing_flag:
+            flag = f" --{extra.replace('_', '-')}" if extra else ""
+            _out("Vorschau. Ausfuehren mit:")
+            _out(f"  python -m src.cli audit-rebaseline --confirm{flag}")
             return 2
-        ledger.rebaseline(run_id=new_run_id(), reason="cli")
-    _out("AUDIT-ANKER = NEU GESETZT (Ereignis HEAD_REBASELINE protokolliert)")
+        ledger.rebaseline(run_id=new_run_id(), reason="cli", verdict=verdict)
+    _out(f"AUDIT-ANKER = NEU GESETZT (Befund {verdict}, Ereignis HEAD_REBASELINE protokolliert)")
     return EXIT_OK
 
 
@@ -417,6 +431,8 @@ def build_parser() -> argparse.ArgumentParser:
         "audit-rebaseline", help="Audit-Anker nach Pruefung neu setzen (nur mit --confirm)", allow_abbrev=False
     )
     rb.add_argument("--confirm", action="store_true")
+    rb.add_argument("--accept-rollback", action="store_true", help="nur bei Befund AUDIT_ROLLBACK")
+    rb.add_argument("--accept-rewrite", action="store_true", help="nur bei Befund AUDIT_HEAD_MISMATCH")
     return p
 
 
