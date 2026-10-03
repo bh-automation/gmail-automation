@@ -170,6 +170,7 @@ def undo_run(
     undone_ids: set[str] = set()
     for i in items:
         if not i.add and not i.remove:
+            _mark_undone(audit, i, i.original)  # nothing to change, but the actions count as undone
             continue
         undo_action = i.acts[-1]["action_id"]
         audit(

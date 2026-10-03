@@ -226,7 +226,7 @@ class Engine:
                     self.out(f"  plan: {a.describe()}" + ("" if enabled else "  [capability aus]"))
                 else:
                     self._execute(a)
-            s.status = "PARTIAL" if (s.message_failures or s.drift) else "OK"
+            s.status = "PARTIAL" if (s.message_failures or s.drift or s.quarantined) else "OK"
         except FailClosed as exc:
             s.status, self.error = "FAILED_CLOSED", exc
         except GmailAutomationError as exc:
@@ -245,12 +245,11 @@ class Engine:
         return s
 
     def _human_override(self, work: ThreadWork) -> bool:
-        """The human's decision wins: app labels changed since this program last set them."""
+        """The human's decision wins: app labels changed since this program last set them, or app
+        labels already present on first contact (set by a person or another client)."""
         last = self.ledger.last_set_labels(work.message.id)
-        if last is None:
-            return False
         current = self.resolver.app_label_names(work.message.label_ids)
-        if current == last:
+        if current == (last if last is not None else ()):
             return False
         self.summary.human_override += 1
         self._audit(
@@ -258,7 +257,7 @@ class Engine:
             thread_id=work.snapshot.thread_id,
             message_id=work.message.id,
             content_fingerprint=work.message.fingerprint,
-            before_state={"labels": list(last)},
+            before_state={"labels": list(last)} if last is not None else None,
             after_state={"labels": list(current)},
             outcome="HUMAN_DECISION_WINS",
         )

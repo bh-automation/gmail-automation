@@ -275,6 +275,11 @@ class AuditLedger:
             seq, h = int(data["seq"]), str(data["hash"])
         except FileNotFoundError:
             return None
+        except (IsADirectoryError, NotADirectoryError, PermissionError) as exc:
+            raise AuditUnavailableError(
+                f"Audit anchor location not readable ({exc.__class__.__name__}): {self.head_path.parent}",
+                code="AUDIT_ANCHOR_UNREADABLE",
+            ) from None
         except (OSError, ValueError, KeyError, TypeError):
             raise AuditIntegrityError(
                 "Audit anchor file is corrupt - check the ledger, then run `audit-rebaseline --confirm`",
@@ -377,7 +382,17 @@ class AuditLedger:
         return seq
 
     @_db_guard
-    def rebaseline(self, *, run_id: str, reason: str = "operator") -> int:
+    def anchor_verdict(self) -> tuple[str, str]:
+        """Diagnosis of the rollback anchor: OK, AUDIT_ANCHOR_MISSING, AUDIT_HEAD_CORRUPT,
+        AUDIT_ROLLBACK (DB older than anchor) or AUDIT_HEAD_MISMATCH (history rewritten)."""
+        try:
+            self._check_head(update=False)
+        except (AuditIntegrityError, AuditUnavailableError) as exc:
+            return exc.code, str(exc)
+        return "OK", "anchor matches the ledger"
+
+    @_db_guard
+    def rebaseline(self, *, run_id: str, reason: str = "operator", verdict: str = "") -> int:
         """Explicit operator repair after AUDIT_ANCHOR_MISSING / AUDIT_HEAD_CORRUPT / AUDIT_ROLLBACK.
 
         Only a ledger whose hash chain is intact can be re-anchored; the act itself is audited."""
@@ -395,7 +410,12 @@ class AuditLedger:
             mode="DRY-RUN",
             event="HEAD_REBASELINE",
             outcome="REBASELINED",
-            detail={"previous_anchor": previous, "db_head": [db_seq, db_hash], "reason": reason[:100]},
+            detail={
+                "previous_anchor": previous,
+                "db_head": [db_seq, db_hash],
+                "verdict": verdict or self.anchor_verdict()[0],
+                "reason": reason[:100],
+            },
         )
 
     # ------------------------------------------------------------------ verify
@@ -523,7 +543,8 @@ class AuditLedger:
 
     @_db_guard
     def failure_streak(self, message_id: str, codes: Iterable[str]) -> int:
-        """Message-scoped FAILED rows for a message since its last successful mutation."""
+        """Failures of a message since its last successful mutation: message-scoped FAILED rows plus
+        writes settled as not applied after a transient error (a message that always gets 5xx)."""
         a_marks, a_vals = self._in(APPLIED_EVENTS)
         c_marks, c_vals = self._in(codes)
         if not c_vals:
@@ -533,8 +554,9 @@ class AuditLedger:
             [message_id, *a_vals],
         ).fetchone()[0]
         row = self._db.execute(
-            f"SELECT COUNT(*) FROM ledger WHERE message_id=? AND event='FAILED' AND seq>? "  # noqa: S608
-            f"AND error_code IN ({c_marks})",
+            "SELECT COUNT(*) FROM ledger WHERE message_id=? AND seq>? AND ("  # noqa: S608 - fixed markers
+            f"(event='FAILED' AND error_code IN ({c_marks})) OR "
+            "(event='RECONCILED_NOT_APPLIED' AND error_code IS NOT NULL))",
             [message_id, int(last or 0), *c_vals],
         ).fetchone()
         return int(row[0])
@@ -544,7 +566,8 @@ class AuditLedger:
         ids = [
             str(r[0])
             for r in self._db.execute(
-                "SELECT DISTINCT message_id FROM ledger WHERE event='FAILED' AND message_id IS NOT NULL"
+                "SELECT DISTINCT message_id FROM ledger WHERE event IN ('FAILED','RECONCILED_NOT_APPLIED') "
+                "AND message_id IS NOT NULL"
             )
         ]
         codes = list(codes)
