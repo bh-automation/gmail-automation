@@ -55,11 +55,10 @@ _OUTLOOK_HEADER = re.compile(r"^\s*\*?(From|Von|De|Da|Van)\s?:\*?\s.+$", re.I)
 _OUTLOOK_FOLLOW = re.compile(
     r"^\s*\*?(Sent|Gesendet|Date|Datum|Envoy(é|e)|Enviado|Inviato|Verzonden|Fecha|Data)\s?:\*?\s.+$", re.I
 )
-# Inline styles that hide text from the human reader; hidden text never counts as content.
-_HIDDEN_STYLE = re.compile(
-    r"display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0(?![.\d]*[1-9])|opacity\s*:\s*0(?![.\d]*[1-9])",
-    re.I,
-)
+# Inline styles that hide text from the human reader; hidden text never drives positive rules.
+_HARD_HIDDEN_STYLE = re.compile(r"display\s*:\s*none|opacity\s*:\s*0(?![.\d]*[1-9])", re.I)
+_VISIBILITY_STYLE = re.compile(r"visibility\s*:\s*(hidden|collapse|visible)", re.I)
+_FONT_SIZE_STYLE = re.compile(r"font-size\s*:\s*(\d+(?:\.\d+)?|\.\d+)", re.I)
 _VOID_TAGS = frozenset({"br", "hr", "img", "meta", "link", "input", "area", "base", "col", "embed", "source", "wbr"})
 
 
@@ -109,76 +108,100 @@ def _decode_text(raw: bytes, charset: str) -> str:
 
 
 class _HtmlText(HTMLParser):
+    """HTML -> text. Tracks CSS visibility per element like a browser does:
+    display:none / hidden / opacity:0 hide a whole subtree (children cannot undo it);
+    visibility:hidden and font-size:0 are inherited but a descendant can re-enable them."""
+
     _BLOCK = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "table", "blockquote", "hr"}
     _SKIP = {"script", "style", "head", "title", "noscript", "template"}
+    # Start tags that implicitly close an open <p> (HTML spec, "p" end tag omission).
+    _P_CLOSERS = {
+        "address", "article", "aside", "blockquote", "details", "div", "dl", "fieldset", "figcaption",
+        "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hgroup", "hr",
+        "main", "menu", "nav", "ol", "p", "pre", "section", "table", "ul",
+    }  # fmt: skip
 
-    def __init__(self, drop_quotes: bool) -> None:
+    def __init__(self, drop_quotes: bool, drop_hidden: bool) -> None:
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self.skip_depth = 0
         self.quote_depth = 0
-        self.hidden_depth = 0
         self.drop_quotes = drop_quotes
-        self.stack: list[tuple[str, bool, bool]] = []
+        self.drop_hidden = drop_hidden
+        # (tag, is_quote, hard_hidden, visibility_hidden, font_size_zero) - effective state per element
+        self.stack: list[tuple[str, bool, bool, bool, bool]] = []
 
-    def _is_quote(self, tag: str, attrs: list[tuple[str, str | None]]) -> bool:
+    def _is_quote(self, tag: str, a: dict[str, str]) -> bool:
         if not self.drop_quotes:
             return False
         if tag == "blockquote":
             return True
-        a = {k.lower(): (v or "") for k, v in attrs}
         cls = a.get("class", "").lower()
         ident = a.get("id", "").lower()
         return "gmail_quote" in cls or ident in {"divrplyfwdmsg", "appendonsend"} or "moz-cite-prefix" in cls
 
-    @staticmethod
-    def _is_hidden(attrs: list[tuple[str, str | None]]) -> bool:
-        a = {k.lower(): (v or "") for k, v in attrs}
-        return "hidden" in a or bool(_HIDDEN_STYLE.search(a.get("style", "")))
+    def _pop(self) -> None:
+        _, quote, *_ = self.stack.pop()
+        if quote and self.quote_depth:
+            self.quote_depth -= 1
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag in self._SKIP:
             self.skip_depth += 1
+        if tag in self._P_CLOSERS and self.stack and self.stack[-1][0] == "p":
+            self._pop()
         if tag not in _VOID_TAGS:
-            quote = self._is_quote(tag, attrs)
-            hidden = self._is_hidden(attrs)
+            a = {k.lower(): (v or "") for k, v in attrs}
+            style = a.get("style", "")
+            quote = self._is_quote(tag, a)
             if quote:
                 self.quote_depth += 1
-            if hidden:
-                self.hidden_depth += 1
-            self.stack.append((tag, quote, hidden))
+            p_hard, p_vis, p_fs = self.stack[-1][2:] if self.stack else (False, False, False)
+            hard = p_hard or "hidden" in a or bool(_HARD_HIDDEN_STYLE.search(style))
+            vis_m = _VISIBILITY_STYLE.search(style)
+            vis = p_vis if vis_m is None else vis_m.group(1).lower() != "visible"
+            fs_m = _FONT_SIZE_STYLE.search(style)
+            fs = p_fs if fs_m is None else _is_zero(fs_m.group(1))
+            self.stack.append((tag, quote, hard, vis, fs))
         if tag in self._BLOCK:
             self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
         if tag in self._SKIP and self.skip_depth:
             self.skip_depth -= 1
-        if any(t == tag for t, _, _ in self.stack):
+        if any(entry[0] == tag for entry in self.stack):
             while self.stack:
-                t, quote, hidden = self.stack.pop()
-                if quote and self.quote_depth:
-                    self.quote_depth -= 1
-                if hidden and self.hidden_depth:
-                    self.hidden_depth -= 1
+                t = self.stack[-1][0]
+                self._pop()
                 if t == tag:
                     break
         if tag in self._BLOCK:
             self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:
-        if not self.skip_depth and not self.quote_depth and not self.hidden_depth:
-            self.parts.append(data)
+        if self.skip_depth or self.quote_depth:
+            return
+        if self.drop_hidden and self.stack and any(self.stack[-1][2:]):
+            return
+        self.parts.append(data)
 
 
-def html_to_text(markup: str, *, drop_quotes: bool = False) -> str:
-    parser = _HtmlText(drop_quotes)
+def _is_zero(number: str) -> bool:
+    try:
+        return float(number) == 0.0
+    except ValueError:
+        return False
+
+
+def html_to_text(markup: str, *, drop_quotes: bool = False, drop_hidden: bool = True) -> str:
+    parser = _HtmlText(drop_quotes, drop_hidden)
     try:
         parser.feed(markup)
         parser.close()
     except Exception:  # noqa: BLE001 - html.parser is lenient, but stay safe
         return re.sub(r"<[^>]+>", " ", html.unescape(markup))
     text = "".join(parser.parts)
-    text = re.sub(r"[ \t ]+", " ", text)
+    text = re.sub(r"[ \t\u00a0]+", " ", text)
     return re.sub(r"\n\s*\n+", "\n\n", text).strip()
 
 
@@ -263,12 +286,14 @@ def normalize_message(msg: dict[str, Any], *, max_body_chars: int, max_raw_bytes
         errors.append("WALK_FAILED")
 
     plain = "\n".join(p for p in plains if p.strip())
+    html_all = "\n".join(htmls)
+    # Safety guards see EVERYTHING the sender put in the mail: every part, quoted and hidden text.
+    guard = "\n".join(t for t in (plain, html_to_text(html_all, drop_hidden=False) if htmls else "") if t)
     if plain.strip():
         body, newest, source = plain, strip_quoted_text(plain), "plain"
     elif htmls:
-        joined = "\n".join(htmls)
-        body = html_to_text(joined)
-        newest = strip_quoted_text(html_to_text(joined, drop_quotes=True))
+        body = html_to_text(html_all)
+        newest = strip_quoted_text(html_to_text(html_all, drop_quotes=True))
         source = "html"
     else:
         body, newest, source = "", "", "none"
@@ -305,4 +330,5 @@ def normalize_message(msg: dict[str, Any], *, max_body_chars: int, max_raw_bytes
         body_source=source,
         parse_errors=tuple(errors),
         fingerprint=fingerprint(mid, internal, subject, newest),
+        guard_text=guard[:max_body_chars],
     )

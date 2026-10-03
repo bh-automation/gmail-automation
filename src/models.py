@@ -48,6 +48,7 @@ class NormalizedMessage:
     body_source: str  # plain | html | none
     parse_errors: tuple[str, ...]
     fingerprint: str
+    guard_text: str = ""  # all parts incl. quoted + hidden text: input for safety guards only
 
     @property
     def is_sent(self) -> bool:

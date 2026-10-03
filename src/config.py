@@ -145,21 +145,27 @@ def _subpatterns(op: Any, av: Any) -> list[Any]:
     return []
 
 
-def _has_unbounded_repeat(items: Any) -> bool:
+_BIG_REPEAT = 10  # an outer repeat with more than this many iterations counts as "large"
+
+
+def _has_inner_ambiguity(items: Any) -> bool:
+    """A repeated sub-pattern is ambiguous if it contains a repeat (bounded or not) or an alternation."""
     for op, av in items:
-        if op in _REPEATS and av[1] == sre_c.MAXREPEAT:
+        if op in _REPEATS and av[1] > 1:
             return True
-        if any(_has_unbounded_repeat(sub) for sub in _subpatterns(op, av)):
+        if op == sre_c.BRANCH and len(av[1]) > 1:
+            return True
+        if any(_has_inner_ambiguity(sub) for sub in _subpatterns(op, av)):
             return True
     return False
 
 
-def _nested_unbounded(items: Any) -> bool:
-    """True for catastrophic-backtracking shapes such as (a+)+, (a*)*, (\\w+\\s*)*."""
+def _catastrophic(items: Any) -> bool:
+    """Shapes with exponential backtracking: (a+)+, (a*)*, (a|a)+, (a{1,10})+, (a+){1,40}, (\\w+\\s*)*."""
     for op, av in items:
-        if op in _REPEATS and av[1] == sre_c.MAXREPEAT and _has_unbounded_repeat(av[2]):
+        if op in _REPEATS and (av[1] == sre_c.MAXREPEAT or av[1] > _BIG_REPEAT) and _has_inner_ambiguity(av[2]):
             return True
-        if any(_nested_unbounded(sub) for sub in _subpatterns(op, av)):
+        if any(_catastrophic(sub) for sub in _subpatterns(op, av)):
             return True
     return False
 
@@ -171,10 +177,11 @@ def _regex(v: Any, name: str) -> re.Pattern[str]:
         parsed = sre_p.parse(v)
     except (re.error, RecursionError, OverflowError) as exc:
         raise _err(f"{name} is not a valid regex: {exc}") from None
-    if _nested_unbounded(parsed):
+    if _catastrophic(parsed):
         raise _err(
-            f"{name} nests unbounded quantifiers (e.g. (a+)+) - catastrophic backtracking on hostile mail; "
-            "rewrite it, or make the inner quantifier possessive (a++) / atomic (?>...)"
+            f"{name} nests unbounded quantifiers or repeats an alternation (e.g. (a+)+, (a|b)+) - "
+            "catastrophic backtracking on hostile mail; rewrite it, or make the repeat possessive "
+            "((?:a|b)++, a++) or atomic ((?>...))"
         )
     return compiled
 
