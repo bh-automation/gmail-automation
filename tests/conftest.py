@@ -68,6 +68,23 @@ def make_config(**over: Any) -> Config:
     return parse_config(data)
 
 
+@pytest.fixture(autouse=True)
+def reset_app_logging():
+    """cli.main() binds log handlers to the (captured) stderr of one test - never leak them."""
+    yield
+    import logging
+
+    logging.getLogger("gmail_automation").handlers.clear()
+
+
+@pytest.fixture(autouse=True)
+def isolated_anchor_dir(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Rollback anchors of test ledgers never touch the real user profile."""
+    d = tmp_path_factory.mktemp("anchors")
+    monkeypatch.setenv("GMAIL_AUTOMATION_ANCHOR_DIR", str(d))
+    return d
+
+
 @pytest.fixture
 def cfg() -> Config:
     return make_config()

@@ -88,7 +88,19 @@ def test_explicit_apply_flag_uses_apply_profile(data_dir, tmp_path, mailbox, cap
     assert "JARVIS/REFERENCE" in mailbox.label_names("m1")
 
 
-def test_apply_failure_returns_nonzero_exit(data_dir, tmp_path, mailbox, capsys):
+def test_global_apply_failure_returns_fail_closed_exit(data_dir, tmp_path, mailbox, capsys):
+    from tests.fakes import http_error
+
+    mailbox.faults["users.messages.modify"] = [http_error(403, "insufficientPermissions")]
+    rc = cli.main(
+        ["run", "--apply", "--config", write_cfg(tmp_path, capabilities={"labels": True})],
+        service_factory=factory_for(mailbox, []),
+    )
+    assert rc == 8 and "FAILED_CLOSED" in capsys.readouterr().out
+
+
+def test_message_scoped_failure_returns_partial_exit(data_dir, tmp_path, mailbox, capsys):
+    from src.errors import EXIT_PARTIAL
     from tests.fakes import http_error
 
     mailbox.faults["users.messages.modify"] = [http_error(400, "failedPrecondition")]
@@ -96,7 +108,8 @@ def test_apply_failure_returns_nonzero_exit(data_dir, tmp_path, mailbox, capsys)
         ["run", "--apply", "--config", write_cfg(tmp_path, capabilities={"labels": True})],
         service_factory=factory_for(mailbox, []),
     )
-    assert rc == 8 and "FAILED_CLOSED" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert rc == EXIT_PARTIAL and "STATUS = PARTIAL" in out and "FEHLGESCHLAGEN = 1" in out
 
 
 def test_status_audit_verify_and_undo_flow(data_dir, tmp_path, mailbox, capsys):

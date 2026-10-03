@@ -86,7 +86,42 @@ PLANTED = {
     "scope.py": "SCOPES = ['https://mail.' + 'google.com/']\nX = 'https://mail.google.com/'\n",
     "bypass.py": "def go(c):\n    return object.__getattribute__(c, '_g_inner')\n",
     "trash.py": "def go(s):\n    return s.users().threads().trash(userId='me', id='1')\n",
+    # Red Team B M7: eight bypasses that used to pass the gate
+    "rt_concat_getattr.py": "def go(m, b):\n    return getattr(m, 'se' + 'nd')(userId='me', body=b)\n",
+    "rt_variable_getattr.py": "VERB = 'x'\ndef go(m):\n    name = VERB\n    return getattr(m, name)\n",
+    "rt_join_getattr.py": "def go(t):\n    return getattr(t, ''.join(['tr', 'ash']))\n",
+    "rt_eval.py": "def go(svc):\n    return eval('svc.users().messages().' + 'send')\n",
+    "rt_dunder_getattr.py": "def go(m):\n    return m.__getattr__('send')\n",
+    "rt_own_service.py": (
+        "from googleapiclient.discovery import build\ndef go(c):\n    return build('gmail', 'v1', credentials=c)\n"
+    ),
+    "rt_raw_rest.py": (
+        "from google.auth.transport.requests import AuthorizedSession\n"
+        "URL = 'https://gmail.googleapis.com/gmail/v1/users/me/messages/' + 'send'\n"
+        "def go(c, raw):\n    return AuthorizedSession(c).post(URL, json={'raw': raw})\n"
+    ),
+    "rt_scope_concat.py": "SCOPES = ['https://mail.' + 'google.com/']\n",
+    "rt_requests.py": "import requests\ndef go():\n    return requests.post('https://example.invalid')\n",
+    "rt_bare_google.py": "import google.auth\ndef go():\n    return google.auth\n",
+    "rt_vars.py": "def go(m):\n    return vars(m)['se' 'nd']\n",
 }
+
+
+def test_forbidden_scan_exemptions_are_bound_to_repository_paths(tmp_path):
+    """A planted file named like the adapter gets no adapter exemptions."""
+    d = tmp_path / "src"
+    d.mkdir()
+    (d / "gmail_client.py").write_text("from googleapiclient.discovery import build\n", encoding="utf-8")
+    (d / "auth.py").write_text("import requests\n", encoding="utf-8")
+    r = run_tool("forbidden_scan.py", d)
+    assert r.returncode == 1 and r.stdout.count("outside the adapter") >= 2
+
+
+def test_forbidden_scan_covers_src_and_tools_by_default():
+    r = run_tool("forbidden_scan.py")
+    n = int(re.search(r"\((\d+) files\)", r.stdout).group(1))
+    expected = len(list((ROOT / "src").rglob("*.py"))) + len(list((ROOT / "tools").rglob("*.py")))
+    assert n == expected
 
 
 @pytest.mark.parametrize("name", sorted(PLANTED))

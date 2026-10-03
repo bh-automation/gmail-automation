@@ -275,16 +275,22 @@ class _Drafts:
     def __init__(self, g: FakeGmail) -> None:
         self.g = g
 
-    def list(self, userId: str, maxResults: int = 100) -> FakeRequest:  # noqa: N803
-        return self.g._dispatch(
-            "users.drafts.list",
-            lambda: {
+    def list(self, userId: str, maxResults: int = 100, pageToken: str | None = None) -> FakeRequest:  # noqa: N803
+        def impl() -> dict[str, Any]:
+            all_drafts = list(self.g.drafts.values())
+            start = int(pageToken or 0)
+            page = all_drafts[start : start + maxResults]
+            res: dict[str, Any] = {
                 "drafts": [
                     {"id": d["id"], "message": {"id": d["message"]["id"], "threadId": d["message"]["threadId"]}}
-                    for d in list(self.g.drafts.values())[:maxResults]
+                    for d in page
                 ]
-            },
-        )
+            }
+            if start + maxResults < len(all_drafts):
+                res["nextPageToken"] = str(start + maxResults)
+            return res
+
+        return self.g._dispatch("users.drafts.list", impl)
 
     def get(self, userId: str, id: str, format: str = "metadata") -> FakeRequest:  # noqa: A002,N803
         def impl() -> dict[str, Any]:

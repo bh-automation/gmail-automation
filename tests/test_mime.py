@@ -21,7 +21,7 @@ def test_html_only_message_strips_script_and_style():
     assert m.body_source == "html"
     assert "alert" not in m.body_text and ".x{}" not in m.body_text
     assert "Bitte unterschreiben" in m.newest_text
-    assert "versteckter Text" in m.body_text  # hidden text is just content - never instruction
+    assert "versteckter Text" not in m.body_text  # invisible text is dropped: it never drives rules
 
 
 def test_empty_body_message():
@@ -83,7 +83,7 @@ def test_unicode_and_rfc2047_headers():
     )
     assert m.subject == "Grüße – Prüfung 🚀"
     assert m.from_address == "joerg@example.de"
-    assert decode_header_value("a\r\nBcc: x@y.z\x00") == "a  Bcc: x@y.z"
+    assert decode_header_value("a\r\nBcc: x@y.z\x00") == "a Bcc: x@y.z"
     assert decode_header_value(None) == ""
     assert decode_header_value("=?bogus?q?x?=") != ""
 

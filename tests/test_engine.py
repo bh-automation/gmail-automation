@@ -8,7 +8,7 @@ from src.audit import AuditLedger
 from src.engine import Engine
 from src.errors import AuditUnavailableError, PolicyViolation
 from tests.conftest import client_for, ctx_for, make_config, run_engine
-from tests.fakes import AfterApply, FakeGmail, b64, http_error, make_message
+from tests.fakes import AfterApply, FakeGmail, http_error, make_message
 
 SIGN = "Hallo, bitte unterschreiben Sie den Vertrag."
 
@@ -104,6 +104,12 @@ def test_drafts_capability_is_independent(ledger):
     assert len(g.drafts) == 0 and "JARVIS/ACTION" in g.label_names("m2")
 
 
+def cfg1_rules():
+    from tests.conftest import BASE_CONFIG
+
+    return BASE_CONFIG["rules"]
+
+
 # ---------------------------------------------------------------- idempotency
 def test_reprocessing_unchanged_data_is_a_no_op(cfg_apply, ledger):
     g = mailbox()
@@ -116,14 +122,39 @@ def test_reprocessing_unchanged_data_is_a_no_op(cfg_apply, ledger):
     assert s3.mutations == 0 and len(g.drafts) == 1
 
 
-def test_idempotency_key_blocks_repeat_even_if_state_reverted_by_crash_window(cfg_apply, ledger):
+def test_manual_label_removal_is_respected(cfg_apply, ledger):
     g = mailbox()
     run_engine(g, cfg_apply, ledger, apply=True)
-    # someone manually removes the label again; content unchanged -> same idempotency key
-    g.messages["m2"]["labelIds"] = ["INBOX"]
+    g.messages["m2"]["labelIds"] = ["INBOX"]  # the human removes the app label again
     s, _ = run_engine(g, cfg_apply, ledger, apply=True)
-    assert s.skipped_idempotent >= 1
+    assert s.human_override == 1 and s.mutations == 0
     assert "JARVIS/ACTION" not in g.label_names("m2")  # the human decision wins; no ping-pong
+
+
+def test_manual_relabel_is_not_reverted_by_next_run(cfg_apply, ledger):
+    """Red Team B M6: a human moving a message to another app label must win."""
+    g = mailbox()
+    run_engine(g, cfg_apply, ledger, apply=True)
+    done = g.add_user_label("JARVIS/DONE")
+    g.messages["m1"]["labelIds"] = ["INBOX", done]  # REFERENCE -> DONE by hand
+    for _ in range(2):
+        s, _ = run_engine(g, cfg_apply, ledger, apply=True)
+        assert s.human_override == 1 and s.mutations == 0
+    assert sorted(n for n in g.label_names("m1") if n.startswith("JARVIS/")) == ["JARVIS/DONE"]
+    assert events(ledger, "SKIPPED_HUMAN_OVERRIDE")
+
+
+def test_rule_change_still_reclassifies_untouched_message(ledger):
+    """Override detection must not freeze messages the human never touched."""
+    g = mailbox()
+    cfg1 = make_config(capabilities={"labels": True, "drafts": False})
+    run_engine(g, cfg1, ledger, apply=True)
+    rules = [dict(r) for r in cfg1_rules()]
+    rules[0] = {**rules[0], "state": "PROJECT"}  # newsletter rule now files into PROJECT
+    cfg2 = make_config(capabilities={"labels": True, "drafts": False}, rules=rules)
+    s, _ = run_engine(g, cfg2, ledger, apply=True)
+    assert s.human_override == 0
+    assert sorted(n for n in g.label_names("m1") if n.startswith("JARVIS/")) == ["JARVIS/PROJECT"]
 
 
 # ---------------------------------------------------------------- races and stale state
@@ -166,7 +197,8 @@ def test_message_deleted_between_list_and_get_is_recorded_not_silent(cfg, ledger
 
 
 # ---------------------------------------------------------------- failures fail closed
-def test_partial_api_failure_stops_run_and_keeps_audit(cfg_apply, ledger):
+def test_message_scoped_failure_is_audited_and_run_continues(cfg_apply, ledger):
+    """Red Team B M5: one rejected message (400) must not stop the whole pipeline."""
     g = mailbox()
     g.add(
         make_message(
@@ -177,15 +209,51 @@ def test_partial_api_failure_stops_run_and_keeps_audit(cfg_apply, ledger):
             internal_date=1_700_000_000_500,
         )
     )
-    # first modify succeeds, second fails with a non-retryable 400
+    # first modify succeeds, second fails with a non-retryable 400 (message-scoped)
     g.faults["users.messages.modify"] = [lambda gm: None, http_error(400, "failedPrecondition")]
     s, eng = run_engine(g, cfg_apply, ledger, apply=True)
-    assert s.status == "FAILED_CLOSED" and eng.error is not None and eng.error.exit_code == 8
-    assert s.failed == 1
+    assert s.status == "PARTIAL" and eng.error is None
+    assert s.failed == 1 and s.message_failures == 1
     assert len(events(ledger, "FAILED")) == 1 and events(ledger, "FAILED")[0]["error_code"] == "API_CLIENT"
-    assert g.calls.count("users.messages.modify") == 2  # nothing after the failure
-    assert len(g.drafts) == 0
-    assert ledger.verify()[0]
+    assert g.calls.count("users.messages.modify") == 3  # the remaining message was still processed
+    assert len(g.drafts) == 1
+    assert ledger.pending() == [] and ledger.verify()[0]
+
+
+def test_poison_message_is_quarantined_after_three_failures(cfg_apply, ledger, monkeypatch):
+    """Red Team B M5: a message that always fails is quarantined; everything else keeps working."""
+    from tests import fakes
+
+    g = mailbox()
+    original_modify = fakes._Messages.modify
+
+    def modify(self, userId, id, body):  # noqa: A002
+        if id == "m1":
+
+            def reject():
+                raise http_error(400, "failedPrecondition")
+
+            return self.g._dispatch("users.messages.modify", reject)
+        return original_modify(self, userId, id, body)
+
+    monkeypatch.setattr(fakes._Messages, "modify", modify)
+    statuses = []
+    for _ in range(4):
+        s, _ = run_engine(g, cfg_apply, ledger, apply=True)
+        statuses.append((s.status, s.message_failures, s.quarantined))
+    assert statuses[:3] == [("PARTIAL", 1, 0)] * 3
+    assert statuses[3] == ("OK", 0, 1)  # 4th run: quarantined, no further attempt
+    assert "JARVIS/ACTION" in g.label_names("m2")  # the rest of the mailbox was processed
+    assert ledger.quarantined(["API_CLIENT", "API_NOT_FOUND", "API_CONFLICT"], 3) == ["m1"]
+    eng_retry = Engine(
+        client_for(g, cfg_apply, apply=True),
+        cfg_apply,
+        ctx_for(cfg_apply, apply=True),
+        ledger,
+        out=lambda s: None,
+        retry_quarantined=True,
+    )
+    assert eng_retry.run().message_failures == 1  # --retry-quarantined tries again
 
 
 def test_403_on_mutation_is_audited_and_fails_closed(cfg_apply, ledger):
@@ -207,7 +275,7 @@ def test_401_loop_is_prevented_at_run_level(cfg, ledger):
     assert s.status == "ERROR:AUTH_401" and refreshes == [1]
 
 
-def test_verify_mismatch_fails_closed(cfg_apply, ledger):
+def test_verify_mismatch_is_applied_with_drift_and_undoable(cfg_apply, ledger):
     g = mailbox()
     project = g.add_user_label("JARVIS/PROJECT")
     orig_dispatch = g._dispatch
@@ -229,9 +297,13 @@ def test_verify_mismatch_fails_closed(cfg_apply, ledger):
 
     g._dispatch = dispatch
     s, _ = run_engine(g, cfg_apply, ledger, apply=True)
-    assert s.status == "FAILED_CLOSED"
-    assert events(ledger, "FAILED")[0]["error_code"] == "VERIFY_MISMATCH"
-    assert g.calls.count("users.messages.modify") == 1
+    # Red Team B M1: the write reached Gmail -> recorded as applied (with drift), never as FAILED
+    assert s.status == "PARTIAL" and s.drift == 1 and s.failed == 0
+    drift = events(ledger, "APPLIED_DRIFT")
+    assert drift and drift[0]["error_code"] == "VERIFY_MISMATCH"
+    assert g.calls.count("users.messages.modify") == 2  # the run continued with m2
+    acts = [a for a in ledger.applied_actions(s.run_id) if a["message_id"] == "m1"]
+    assert acts and not acts[0]["undone"]  # visible to undo (its drift check protects it)
 
 
 # ---------------------------------------------------------------- crash recovery (write-ahead audit)
@@ -298,8 +370,10 @@ def test_duplicate_draft_protection(cfg_apply, ledger):
     g = mailbox()
     run_engine(g, cfg_apply, ledger, apply=True)
     assert len(g.drafts) == 1
-    g.messages["m2"]["labelIds"] = ["INBOX"]  # force re-planning of the thread
-    g.messages["m2"]["payload"]["parts"][0]["body"]["data"] = b64(SIGN + " (Erinnerung)")
+    # a reminder arrives in the same thread -> new newest message, same rule, same template
+    g.add(
+        make_message("m2b", "t2", subject="Re: Vertrag", plain=SIGN + " (Erinnerung)", internal_date=1_700_000_009_000)
+    )
     s, _ = run_engine(g, cfg_apply, ledger, apply=True)
     assert len(g.drafts) == 1 and s.duplicate_drafts == 1
 
