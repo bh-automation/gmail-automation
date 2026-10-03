@@ -1,0 +1,14 @@
+# Exact versions of the development / gate tools (ruff, mypy, pytest). Pinned so that a new
+# tool release can never flip a release gate without a code change. Update deliberately.
+ast_serialize==0.12.0
+iniconfig==2.3.0
+librt==0.16.0
+mypy==2.4.0
+mypy_extensions==1.1.0
+packaging==26.3
+pathspec==1.1.1
+pluggy==1.6.0
+Pygments==2.21.0
+pytest==9.1.1
+ruff==0.16.10
+types-PyYAML==6.0.12.20260906

@@ -4,24 +4,28 @@ on: [push, pull_request]
 permissions:
   contents: read
 
+# Pinned by major tag. Before publishing the repository, pin both actions to a full commit SHA
+# (Dependabot "github-actions" keeps them current) - see docs/RELEASE_GATES.md, residual R-CI-1.
 jobs:
   verify:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        python: ["3.12", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - name: Install (pinned runtime + dev tools)
+          python-version: ${{ matrix.python }}
+      - name: Install (pinned runtime + pinned gate tools)
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-lock.txt
           python -m pip install --no-deps -e .
-          python -m pip install "pytest>=8" "ruff>=0.6" "mypy>=1.10" types-PyYAML
+          python -m pip install -r requirements-dev-lock.txt
+          python -m pip check
       - name: G1 lint (ruff)
         run: |
           python -m ruff check src tests tools
@@ -30,11 +34,45 @@ jobs:
         run: python -m mypy
       - name: G3 secret scan
         run: python tools/secret_scan.py
-      - name: G4-G6 forbidden Gmail method scan
+      - name: G4-G6 forbidden Gmail method / transport / reflection scan (src + tools)
         run: python tools/forbidden_scan.py
       - name: Config validation
         run: python -m src.cli config-check --config config/rules.example.yaml
       - name: G2 tests (offline, no Gmail account, no secrets)
         env:
           GMAIL_AUTOMATION_HOME: ${{ runner.temp }}/ga home ä
+          GMAIL_AUTOMATION_ANCHOR_DIR: ${{ runner.temp }}/ga anchors
         run: python -m pytest
+
+  windows-scripts:
+    # Runs the real operator entry points: bootstrap + verify, in Windows PowerShell 5.1 AND PowerShell 7.
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Line endings of shipped Windows scripts are CRLF
+        shell: pwsh
+        run: |
+          foreach ($f in "START_GMAIL_AUTOMATION.cmd", "scripts/bootstrap.ps1", "scripts/verify.ps1") {
+            $b = [System.IO.File]::ReadAllBytes($f)
+            $lf = ($b | Where-Object { $_ -eq 10 }).Count
+            $crlf = ([regex]::Matches([System.Text.Encoding]::ASCII.GetString($b), "`r`n")).Count
+            if ($lf -ne $crlf) { throw "$f is not CRLF" }
+          }
+      - name: Bootstrap (${{ matrix.shell }})
+        run: ${{ matrix.shell }} -NoProfile -ExecutionPolicy Bypass -File scripts/bootstrap.ps1
+      - name: Verify all release gates (${{ matrix.shell }})
+        env:
+          GMAIL_AUTOMATION_ANCHOR_DIR: ${{ runner.temp }}/ga anchors
+        run: ${{ matrix.shell }} -NoProfile -ExecutionPolicy Bypass -File scripts/verify.ps1
+      - name: Doctor runs without credentials (expected FAIL only for missing client_secret/tokens)
+        shell: pwsh
+        run: |
+          .venv\Scripts\python.exe -m src.cli doctor
+          if ($LASTEXITCODE -notin 0, 2) { throw "doctor crashed ($LASTEXITCODE)" }

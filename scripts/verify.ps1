@@ -20,11 +20,13 @@ Gate "G1 FORMAT"      { & $Py -m ruff format --check src tests tools }
 Gate "G1 TYPES"       { & $Py -m mypy }
 Gate "G3 SECRET SCAN" { & $Py (Join-Path $Tools "secret_scan.py") }
 Gate "G4-6 FORBIDDEN" { & $Py (Join-Path $Tools "forbidden_scan.py") }
+Gate "DEPENDENCIES"   { & $Py -m pip check }
 Gate "CONFIG"         { & $Py -m src.cli config-check --config $Example }
-$OldHome = $env:GMAIL_AUTOMATION_HOME
+$OldHome = $env:GMAIL_AUTOMATION_HOME; $OldAnchor = $env:GMAIL_AUTOMATION_ANCHOR_DIR
 $env:GMAIL_AUTOMATION_HOME = Join-Path ([System.IO.Path]::GetTempPath()) "gmail-automation verify"
+$env:GMAIL_AUTOMATION_ANCHOR_DIR = Join-Path ([System.IO.Path]::GetTempPath()) "gmail-automation verify anchors"
 Gate "G2 TESTS"       { & $Py -m pytest }
-$env:GMAIL_AUTOMATION_HOME = $OldHome
+$env:GMAIL_AUTOMATION_HOME = $OldHome; $env:GMAIL_AUTOMATION_ANCHOR_DIR = $OldAnchor
 
 Write-Host ""
 $failed = $false

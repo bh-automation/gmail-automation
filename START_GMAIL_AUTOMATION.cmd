@@ -1,12 +1,13 @@
 @echo off
 REM GMAIL-AUTOMATION - Startmenue. Dieses Skript aendert NIE das Postfach (kein APPLY).
 setlocal EnableExtensions
-cd /d "%~dp0"
+pushd "%~dp0"
 set "PYTHONUTF8=1"
 set "PY=%~dp0.venv\Scripts\python.exe"
 
-if not exist "%PY%" (
-  echo Erste Einrichtung: virtuelle Umgebung wird angelegt ...
+REM Setup missing, interrupted or outdated? bootstrap.ps1 checks and repairs it (marker + lock hash).
+if not exist "%~dp0.venv\.bootstrap-ok" (
+  echo Einrichtung: virtuelle Umgebung wird angelegt bzw. repariert ...
   powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\bootstrap.ps1"
   if errorlevel 1 goto :failed
 )
@@ -35,8 +36,10 @@ goto :menu
 :failed
 echo Einrichtung fehlgeschlagen - siehe Meldung oben.
 pause
+popd
 exit /b 1
 
 :end
+popd
 endlocal
 exit /b 0
