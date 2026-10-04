@@ -2,6 +2,8 @@
 
 Lokale, abgesicherte Gmail-Automatisierung für Windows: **lesen → klassifizieren → Labels setzen → Antwort-Entwürfe anlegen** – mit Audit und Undo.
 
+> **English summary:** Local, hardened Gmail automation for Windows (Python). It reads and classifies mail, can set labels and create reply *drafts* – never sends, never deletes. Default is DRY-RUN; every change is audited (write-ahead log, hash chain) and can be undone with a conflict check. Separate OAuth profiles (`gmail.readonly` for scans; `gmail.modify` only for APPLY – sending and deleting are blocked by the application, not by Google), mail content is treated as untrusted data, failures stop the run (fail closed). Tested on Ubuntu and Windows (PowerShell 5.1 and 7). See [SECURITY.md](SECURITY.md) and the docs below.
+
 Standard ist immer **DRY-RUN**: Das Programm zeigt nur an, was es tun würde. Änderungen am Postfach brauchen drei Dinge gleichzeitig: das CLI-Flag `--apply`, das OAuth-Profil **APPLY** und eine eingeschaltete Fähigkeit in `config/rules.yaml`.
 
 ## Sicherheitszusagen (V1, in der Anwendung erzwungen)
@@ -123,4 +125,4 @@ Die Tests brauchen kein Gmail-Konto und keine Secrets. CI läuft auf Ubuntu und 
 - [Release-Gates G1–G16 und Restrisiken](docs/RELEASE_GATES.md)
 - [Bedrohungsmodell](docs/THREAT_MODEL.md) · [Sicherheitsmodell](docs/SECURITY_MODEL.md) · [Architektur](docs/ARCHITECTURE.md) · [OAuth-Scope-Matrix](docs/OAUTH_SCOPE_MATRIX.md)
 - Red-Team-Berichte: [A – Angriffe auf das Produkt](docs/RED_TEAM_A_REPORT.md) · [B – Betrieb und Zuverlässigkeit](docs/RED_TEAM_B_REPORT.md) · [C – Prüfung der Fixes](docs/RED_TEAM_C_FIX_VERIFICATION.md)
-- [Änderungen](CHANGELOG.md)
+- [Änderungen](CHANGELOG.md) · [Sicherheitsrichtlinie / Security Policy](SECURITY.md)
